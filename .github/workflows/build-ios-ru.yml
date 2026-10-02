@@ -76,6 +76,9 @@ jobs:
       - name: Generate yomikiri dictionary
         run: task --verbose yomikiri-dictionary-generator:generate
 
+      - name: Pre-generate files that Xcode expects to already exist
+        run: task --verbose build:ios
+
       - name: Build iOS app (unsigned)
         run: |
           set -euo pipefail
