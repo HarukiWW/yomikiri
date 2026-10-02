@@ -1,0 +1,132 @@
+name: Build iOS (Russian dictionary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Path to .xcodeproj (leave empty to auto-detect)'
+        required: false
+        default: ''
+      scheme:
+        description: 'Xcode scheme (leave empty to auto-detect)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROJECT_INPUT: ${{ inputs.project }}
+      SCHEME_INPUT: ${{ inputs.scheme }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
+
+      - name: Install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+
+      - name: Install cargo
+        uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # v1.85.1
+        with:
+          toolchain: 1.85.0
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Install Task
+        uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      - name: Install pnpm deps
+        run: pnpm install
+
+      - name: Download Russian dictionary from release "dict"
+        run: |
+          mkdir -p custom-dict
+          gh release download dict --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --dir custom-dict --clobber
+          ls -la custom-dict
+
+      - name: Download original JMdict files (JMnedict is still needed)
+        run: task yomikiri-dictionary-generator:download
+
+      - name: Replace JMdict with Russian dictionary
+        run: |
+          set -euo pipefail
+          ORIG=$(find . -name jmdict_english.xml -not -path '*/node_modules/*' -not -path '*/target/*' | head -n1)
+          echo "jmdict file: $ORIG"
+          test -n "$ORIG"
+          ZIP=$(ls custom-dict/*.zip | head -n1)
+          python3 custom-dict/kolobok_to_jmdict.py "$ZIP" /tmp/jmdict_ru.xml --orig "$ORIG"
+          mv /tmp/jmdict_ru.xml "$ORIG"
+          ls -la "$ORIG"
+
+      - name: Generate yomikiri dictionary
+        run: task --verbose yomikiri-dictionary-generator:generate
+
+      - name: Build iOS app (unsigned)
+        run: |
+          set -euo pipefail
+          PROJ="$PROJECT_INPUT"
+          if [ -z "$PROJ" ]; then
+            PROJ=$(find . -name '*.xcodeproj' -not -path '*/node_modules/*' -not -path '*/Pods/*' -not -path '*/target/*' | head -n1)
+          fi
+          echo "Project: $PROJ"
+          xcodebuild -list -project "$PROJ"
+          SCHEME="$SCHEME_INPUT"
+          if [ -z "$SCHEME" ]; then
+            SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "
+          import json, sys
+          s = json.load(sys.stdin)['project']['schemes']
+          bad = ('extension', 'tokenizer', 'test')
+          good = [x for x in s if 'yomikiri' in x.lower() and not any(b in x.lower() for b in bad)]
+          print((good or s)[0])
+          ")
+          fi
+          echo "Scheme: $SCHEME"
+          xcodebuild \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Package .ipa
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products -maxdepth 2 -name '*.app' | head -n1)
+          echo "App: $APP"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          (cd ipa && zip -qry ../Yomikiri-RU.ipa Payload)
+          ls -la Yomikiri-RU.ipa
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yomikiri-RU-ipa
+          path: Yomikiri-RU.ipa
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
