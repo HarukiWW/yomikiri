@@ -9,8 +9,16 @@ import Foundation
 
 /// Returns URL path to directory that all Yomikiri apps share
 public func getSharedDirectory() throws -> URL {
-    guard let dir = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) else {
+    let fm = FileManager.default
+    if let dir = fm.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) {
+        return dir
+    }
+    // Fallback for sideloaded builds without App Group access
+    guard let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
         throw YomikiriTokenizerError.CouldNotAccessDirectory
+    }
+    if !fm.fileExists(atPath: dir.path) {
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
     }
     return dir
 }
