@@ -50,6 +50,13 @@ jobs:
         with:
           node-version: 20
 
+      - name: Make Node 20 the default node (Xcode scripts use a fixed PATH)
+        run: |
+          sudo ln -sf "$(command -v node)" /usr/local/bin/node
+          sudo ln -sf "$(command -v npm)" /usr/local/bin/npm
+          sudo ln -sf "$(command -v npx)" /usr/local/bin/npx
+          /usr/local/bin/node --version
+
       - name: Install cargo
         uses: dtolnay/rust-toolchain@stable
         with:
