@@ -220,7 +220,7 @@ jobs:
                   {"name": "Sentence", "content": "sentence", "style": "basic", "word": "none"},
                   {"name": "SentenceMeaning", "content": "translated-sentence"},
                   {"name": "Audio", "content": "audio"},
-                  {"name": "SentenceAudio", "content": ""},
+                  {"name": "SectenceAudio", "content": ""},
                   {"name": "Image", "content": ""},
                   {"name": "Furigana", "content": "word", "form": "main-dict-form", "style": "furigana-anki"},
               ],
@@ -233,6 +233,12 @@ jobs:
           assert s.count(old) == 1, "default anki options not found in config.ts"
           tpl_ts = json.dumps(template, indent=2, ensure_ascii=False).replace("\n", "\n  ")
           s = s.replace(old, '  "anki.anki_template": ' + tpl_ts + ',\n  "anki.enabled": true,')
+          p.write_text(s)
+
+          # translate.ts: translate sentences into Russian instead of English
+          p = pathlib.Path("src/main/src/platform/common/translate.ts")
+          s = p.read_text()
+          s = replace_once(s, 'const targetLang = "en";', 'const targetLang = "ru";', "translate target language")
           p.write_text(s)
 
           print("audio patch OK")
