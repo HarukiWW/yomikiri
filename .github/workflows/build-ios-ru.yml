@@ -124,6 +124,7 @@ jobs:
           echo "App: $APP"
           mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
+          find ipa/Payload \( -name "*.appex" -o -name "*.framework" -o -name "*.app" \) -print0 | xargs -0 -I{} codesign --remove-signature "{}" || true
           (cd ipa && zip -qry ../Yomikiri-RU.ipa Payload)
           ls -la Yomikiri-RU.ipa
 
