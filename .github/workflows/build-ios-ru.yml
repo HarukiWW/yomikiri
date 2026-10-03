@@ -127,7 +127,18 @@ jobs:
           find ipa/Payload \( -name "*.appex" -o -name "*.framework" -o -name "*.app" \) -print0 | xargs -0 -I{} codesign --remove-signature "{}" || true
           (cd ipa && zip -qry ../Yomikiri-RU.ipa Payload)
           ls -la Yomikiri-RU.ipa
-
+      - name: Inspect binaries (diagnostics)
+        run: |
+          cd ipa/Payload/*.app
+          find . -type f -exec file {} + | grep Mach-O | cut -d: -f1 | while read -r f; do
+            echo "=== $f"
+            ls -la "$f"
+            size -m "$f" | head -8 || true
+            vtool -show-build "$f" 2>&1 | head -8 || true
+            codesign -dvv "$f" 2>&1 | head -6 || true
+          done
+        continue-on-error: true
+        
       - name: Upload ipa
         uses: actions/upload-artifact@v4
         with:
