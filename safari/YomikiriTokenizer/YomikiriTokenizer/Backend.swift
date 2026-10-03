@@ -93,5 +93,14 @@ func migrateDatabaseFrom0(db: RustDatabase) throws {
 }
 
 private func getSharedContainerURL() -> URL? {
-    return FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID)
+    let fm = FileManager.default
+    if let url = fm.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) {
+        return url
+    }
+    // Sideloaded build without App Group: fall back to the app's private folder
+    guard let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+        return nil
+    }
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
 }
