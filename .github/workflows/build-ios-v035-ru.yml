@@ -142,6 +142,72 @@ jobs:
           print("patched OK")
           PY
 
+      - name: Patch TypeScript (add "audio" field type)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          d = pathlib.Path("src/main/src/lib/anki")
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          # template.ts: new field type "audio"
+          p = d / "template.ts"
+          s = p.read_text()
+          s = replace_once(s, '  link: FieldBase<"link">;\n}', '  link: FieldBase<"link">;\n  audio: FieldBase<"audio">;\n}', "types")
+          s = replace_once(s, '  "url",\n  "link",\n];', '  "url",\n  "link",\n  "audio",\n];', "type list")
+          s = replace_once(s, '  link: "link",\n};', '  link: "link",\n  audio: "audio",\n};', "labels")
+          s = replace_once(s, '    content === "link"\n  ) {', '    content === "link" ||\n    content === "audio"\n  ) {', "new field")
+          p.write_text(s)
+
+          # ankiBuilder.ts: builder for "audio"
+          p = d / "ankiBuilder.ts"
+          s = p.read_text()
+          s += """
+          /**
+           * Audio from JapanesePod101.
+           *
+           * AnkiMobile downloads a field's content by itself if the whole field is a link
+           * to an audio file, and replaces it with a [sound:...] tag.
+           * The link must end with a known file extension, so a fake argument is appended.
+           */
+          const JPOD101_URL = "https://assets.languagepod101.com/dictionary/japanese/audiomp3.php";
+          /** Size of the 'audio not available' clip that JapanesePod101 returns. */
+          const JPOD101_PLACEHOLDER_SIZE = 52288;
+
+          async function findJpod101Audio(word: string, reading: string): Promise<string> {
+            const query = `?kanji=${encodeURIComponent(word)}&kana=${encodeURIComponent(reading)}`;
+            try {
+              const resp = await fetch(JPOD101_URL + query);
+              if (!resp.ok) return "";
+              const buf = await resp.arrayBuffer();
+              if (buf.byteLength === JPOD101_PLACEHOLDER_SIZE || buf.byteLength < 2000) {
+                return "";
+              }
+            } catch (err) {
+              // Could not verify (network or cross-origin restrictions).
+              // Still give the link to AnkiMobile.
+              console.warn("Could not check JapanesePod101 audio:", err);
+            }
+            return JPOD101_URL + query + "&fakePath=audio.mp3";
+          }
+
+          addBuilder("audio", (_opts, data) => {
+            const token = data.tokenized.tokens[data.tokenized.tokenIdx];
+            const word = token.base;
+            const reading = getReadingForForm(data.entry, word, false).reading || word;
+            return Utils.PromiseWithProgress.fromPromise(
+              findJpod101Audio(word, reading),
+              "Finding audio...",
+            );
+          });
+          """
+          p.write_text(s)
+          print("audio patch OK")
+          PY
+
       - name: Pre-generate files that Xcode expects to already exist
         working-directory: src
         run: |
