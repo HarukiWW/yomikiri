@@ -11,6 +11,10 @@ on:
         description: 'Xcode scheme (leave empty to auto-detect)'
         required: false
         default: ''
+      english:
+        description: 'Control build: keep the ORIGINAL English dictionary'
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -25,6 +29,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select Xcode 16.2
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2'
 
       - name: Install pnpm
         uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
@@ -50,17 +59,11 @@ jobs:
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
-      - name: Select Xcode 16.2
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: '16.2'
-
-
-
       - name: Install pnpm deps
         run: pnpm install
 
       - name: Download Russian dictionary from release "dict"
+        if: ${{ !inputs.english }}
         run: |
           mkdir -p custom-dict
           gh release download dict --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --dir custom-dict --clobber
@@ -70,6 +73,7 @@ jobs:
         run: task yomikiri-dictionary-generator:download
 
       - name: Replace JMdict with Russian dictionary
+        if: ${{ !inputs.english }}
         run: |
           set -euo pipefail
           ORIG=$(find . -name jmdict_english.xml -not -path '*/node_modules/*' -not -path '*/target/*' | head -n1)
@@ -127,6 +131,7 @@ jobs:
           find ipa/Payload \( -name "*.appex" -o -name "*.framework" -o -name "*.app" \) -print0 | xargs -0 -I{} codesign --remove-signature "{}" || true
           (cd ipa && zip -qry ../Yomikiri-RU.ipa Payload)
           ls -la Yomikiri-RU.ipa
+
       - name: Inspect binaries (diagnostics)
         run: |
           cd ipa/Payload/*.app
@@ -138,7 +143,7 @@ jobs:
             codesign -dvv "$f" 2>&1 | head -6 || true
           done
         continue-on-error: true
-        
+
       - name: Upload ipa
         uses: actions/upload-artifact@v4
         with:
