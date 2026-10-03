@@ -205,6 +205,36 @@ jobs:
           });
           """
           p.write_text(s)
+          # config.ts: bake the Anki template into the defaults.
+          # Sideloaded builds have no shared storage, so the extension cannot see
+          # settings saved in the app. Stored settings still override these defaults.
+          import json
+          DEFAULT_TEMPLATE = {
+              "deck": "yomikiri",
+              "notetype": "kaishi mining",
+              "tags": "yomikiri-ru",
+              "fields": [
+                  {"name": "Word", "content": "word", "form": "as-is", "style": "basic"},
+                  {"name": "Reading", "content": ""},
+                  {"name": "Meaning", "content": "meaning", "full_format": "numbered", "full_pos": False, "full_max_item": 0, "single_pos": False, "single_max_item": 0},
+                  {"name": "Sentence", "content": "sentence", "style": "basic", "word": "none"},
+                  {"name": "SentenceMeaning", "content": "translated-sentence"},
+                  {"name": "Audio", "content": "audio"},
+                  {"name": "SentenceAudio", "content": ""},
+                  {"name": "Image", "content": ""},
+                  {"name": "Furigana", "content": "word", "form": "main-dict-form", "style": "furigana-anki"},
+              ],
+          }
+          override = pathlib.Path("ours/custom-dict/anki_template.json")
+          template = json.loads(override.read_text()) if override.exists() else DEFAULT_TEMPLATE
+          p = pathlib.Path("src/main/src/lib/config.ts")
+          s = p.read_text()
+          old = '  "anki.anki_template": null,\n  "anki.enabled": false,'
+          assert s.count(old) == 1, "default anki options not found in config.ts"
+          tpl_ts = json.dumps(template, indent=2, ensure_ascii=False).replace("\n", "\n  ")
+          s = s.replace(old, '  "anki.anki_template": ' + tpl_ts + ',\n  "anki.enabled": true,')
+          p.write_text(s)
+
           print("audio patch OK")
           PY
 
