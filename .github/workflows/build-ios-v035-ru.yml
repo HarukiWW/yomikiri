@@ -1,0 +1,193 @@
+name: Build iOS v0.3.5 (Russian dictionary)
+
+# Builds the official v0.3.5 release code (same code as the App Store version)
+# with the Russian dictionary and sideload-friendly fixes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      english:
+        description: 'Control build: keep the ORIGINAL English dictionary'
+        type: boolean
+        default: false
+
+env:
+  RELEASE_COMMIT: 0f9ea39181d1dc66ce715665f5ef08b494e261a1
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout our files (dictionary converter)
+        uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: Checkout v0.3.5 release code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_COMMIT }}
+          path: src
+
+      - name: Select Xcode 16.2
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.2'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: src/package.json
+          run_install: false
+
+      - name: Install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install cargo
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - name: Install wasm-pack
+        run: npm install -g wasm-pack
+
+      - name: Install pnpm deps
+        working-directory: src
+        run: pnpm install --frozen-lockfile
+
+      - name: Download Russian dictionary from release "dict"
+        if: ${{ !inputs.english }}
+        run: |
+          mkdir -p ours/custom-dict
+          gh release download dict --repo "$GITHUB_REPOSITORY" --pattern '*.zip' --dir ours/custom-dict --clobber
+          ls -la ours/custom-dict
+
+      - name: Download original JMdict files (JMnedict is still needed)
+        working-directory: src
+        run: pnpm run --dir ./crates/yomikiri-dictionary-generator download
+
+      - name: Replace JMdict with Russian dictionary
+        if: ${{ !inputs.english }}
+        run: |
+          set -euo pipefail
+          ORIG=src/crates/yomikiri-dictionary-generator/jmdict/jmdict_english.xml
+          ls -la "$ORIG"
+          ZIP=$(ls ours/custom-dict/*.zip | head -n1)
+          python3 ours/custom-dict/kolobok_to_jmdict.py "$ZIP" /tmp/jmdict_ru.xml --orig "$ORIG"
+          mv /tmp/jmdict_ru.xml "$ORIG"
+          ls -la "$ORIG"
+
+      - name: Generate yomikiri dictionary
+        working-directory: src
+        run: pnpm run --dir ./crates/yomikiri-dictionary-generator generate
+
+      - name: Patch Swift (work without App Group)
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          d = pathlib.Path("src/safari/YomikiriTokenizer/YomikiriTokenizer")
+
+          p = d / "Utils.swift"
+          s = p.read_text()
+          m = re.search(r"public func getSharedDirectory\(\) throws -> URL \{.*?\n\}\n", s, re.S)
+          assert m, "getSharedDirectory() not found in Utils.swift"
+          new = '''public func getSharedDirectory() throws -> URL {
+              let fm = FileManager.default
+              if let dir = fm.containerURL(forSecurityApplicationGroupIdentifier: APP_GROUP_ID) {
+                  return dir
+              }
+              // Fallback for sideloaded builds without App Group access
+              guard let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+                  throw YomikiriTokenizerError.CouldNotAccessDirectory
+              }
+              if !fm.fileExists(atPath: dir.path) {
+                  try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+              }
+              return dir
+          }
+          '''
+          p.write_text(s[: m.start()] + new + s[m.end():])
+
+          p = d / "Storage.swift"
+          s = p.read_text()
+          m = re.search(r"private func getSharedDefaults\(\) -> Result<UserDefaults, YomikiriTokenizerError> \{.*?\n\}\n", s, re.S)
+          assert m, "getSharedDefaults() not found in Storage.swift"
+          new = '''private func getSharedDefaults() -> Result<UserDefaults, YomikiriTokenizerError> {
+              if let sharedDefault = UserDefaults(suiteName: APP_GROUP_ID) {
+                  return .success(sharedDefault)
+              }
+              return .success(UserDefaults.standard)
+          }
+          '''
+          p.write_text(s[: m.start()] + new + s[m.end():])
+          print("patched OK")
+          PY
+
+      - name: Pre-generate files that Xcode expects to already exist
+        working-directory: src
+        run: |
+          pnpm generate:release
+          pnpm build:ios
+
+      - name: Build iOS app (unsigned)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          PROJ=safari/Yomikiri.xcodeproj
+          xcodebuild -list -project "$PROJ"
+          SCHEME=$(xcodebuild -list -json -project "$PROJ" | python3 -c "
+          import json, sys
+          s = json.load(sys.stdin)['project']['schemes']
+          bad = ('extension', 'tokenizer', 'test')
+          good = [x for x in s if 'yomikiri' in x.lower() and not any(b in x.lower() for b in bad)]
+          print((good or s)[0])
+          ")
+          echo "Scheme: $SCHEME"
+          xcodebuild \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            -skipPackagePluginValidation -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee xcodebuild.log
+
+      - name: Package .ipa
+        working-directory: src
+        run: |
+          set -euo pipefail
+          APP=$(find build/Build/Products -maxdepth 2 -name '*.app' | head -n1)
+          echo "App: $APP"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          find ipa/Payload \( -name "*.appex" -o -name "*.framework" -o -name "*.app" \) -print0 | xargs -0 -I{} codesign --remove-signature "{}" || true
+          (cd ipa && zip -qry ../Yomikiri-RU-v035.ipa Payload)
+          ls -la Yomikiri-RU-v035.ipa
+
+      - name: Upload ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yomikiri-RU-v035-ipa
+          path: src/Yomikiri-RU-v035.ipa
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log-v035
+          path: src/xcodebuild.log
+          if-no-files-found: ignore
