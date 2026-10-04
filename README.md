@@ -1,80 +1,11 @@
-# Yomikiri
+# Yomikiri (Русская версия)
 
-Yomikiri is a Japanese immersion learning tool. As you read Japanese text and encounter words you don't know, look up the meaning and add the word to Anki flashcards.
+Этот репозиторий представляет собой адаптированную версию проекта Yomikiri, созданную специально для русскоязычных изучающих японский язык. Оригинальный проект, послуживший основой для этой работы, можно найти по ссылке: https://github.com/BlueGreenMagick/yomikiri. Данная версия является нейрофорком.
 
-Yomikiri is available for Chrome, Firefox, and iOS.
+Главное и наиболее полезное изменение этой сборки заключается в полной языковой адаптации процесса обучения. Встроенный английский словарь был полностью заменен на словарь Колобок, который предоставляет качественные русско-японские определения, примеры использования и грамматические пометы. Ознакомиться с оригинальным проектом словаря можно здесь: https://ganqqwerty.github.io/jp-ru-kolobok-dictionary/. 
 
-<div>
-<a href="https://chromewebstore.google.com/detail/iecicegmfmljmefcaknlkaaniemghefc"><img alt="Available in the Chrome Web Store" src="https://i.imgur.com/Mw6ip7o.png" height="48"/></img></a>
-<a href="https://addons.mozilla.org/en-US/firefox/addon/yomikiri"><img alt="Get the add-on for Firefox" src="https://blog.mozilla.org/addons/files/2020/04/get-the-addon-fx-apr-2020.svg" height="48"></img></a>
-<a href="https://apps.apple.com/us/app/yomikiri/id6479743831"><img alt="Download on the App Store" src="https://i.imgur.com/nRP4dWp.png" height="48"></img></a>
-</div>
+Вторым ключевым улучшением является интеграция аудио в процесс майнинга. В оригинальной версии эта функция отсутствовала или была ограничена. В данном форке добавлен парсинг и автоматическое добавление звукового произношения в карточки Anki. Также в систему встроен автоматический перевод предложений с японского на русский язык, что избавляет от необходимости использовать сторонние переводчики во время чтения.
 
-## Features
+Для повышения комфорта длительного чтения были внесены изменения в пользовательский опыт. Интерфейс как самого мобильного приложения, так и браузерного расширения был полностью переведен на русский язык. Все меню, настройки и всплывающие подсказки теперь интуитивно понятны. В дополнение к этому, визуальная часть проекта была переработана: и приложение, и расширение по умолчанию используют строгую темную тему. Это существенно снижает нагрузку на глаза при чтении веб-новелл или манги в вечернее время и делает работу с инструментом более приятной.
 
-- Shift + Hover over a word to view definition. It recognizes word boundaries within sentence.\
-  <img src="./extra/resources/screenshots/desktop-tooltip.jpg?raw=true" height="240"/>
-
-- Search words and sentences in popup.\
-  <img src="./extra/resources/screenshots/desktop-popup.jpg?raw=true" height="240"/>
-
-- Add word to Anki. You can preview and edit the note before adding.\
-  If Anki is not running, notes are stored and automatically added later. You don't have to keep Anki running in the background all the time.\
-  <img src="./extra/resources/screenshots/desktop-tooltip-anki.jpg?raw=true" height="240"/>
-
-- Customizable Anki note template.\
-  <img src="./extra/resources/screenshots/desktop-anki-configuration.jpg?raw=true" height="240"/>
-
-- View sentence translation.
-- View relevant grammar with a link to Tofugu.
-
-## Building from source
-
-Please note that we do not support building the project on Windows. You may want to use [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) to build the project. The build system has only been tested on MacOS 14 (ARM) however, and may not quite work on Linux.
-
-[NodeJS](https://nodejs.org/en/download), [pnpm](https://pnpm.io/installation), [Rust & cargo](https://www.rust-lang.org/tools/install), [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/), [Taskfile](https://taskfile.dev/installation/) must be installed.
-
-To build for all targets, run the following commands. If you only need to build for desktop browser extension, go to later section instead.
-
-```sh
-# install node dependencies
-pnpm install
-# Build chrome, firefox web extensions, and get mostly there with the ios app
-task build:extensions RELEASE=1
-```
-
-The desktop browser extensions are built into `/main/build/`.
-
-To build for ios, open `/safari/Yomikiri.xcodeproj` on XCode, and run build.
-
-## Development
-
-After modification, run `task format` to fix formatting, `task lint` to check for lint errors, and `task test` to run tests. These commands are universal, and are defined in repo root, and all sub packages and crates where relevant.
-
-### Chrome
-
-Run `task dev:chrome` or `task dev` for short.
-
-In Chrome, go to `chrome://extensions/`, toggle developer mode. Press 'Load unpacked' and open `/main/build/chrome`.
-
-### Firefox
-
-Run `task dev:firefox`.
-
-In Firefox, type `about:debugging` in the url bar to open debugging menu. Switch to 'This Firefox' tab.
-Press 'Load Temporary Add-on...' and open `/main/build/firefox/manifest.json`.
-
-### IOS
-
-Open `/safari/Yomikiri.xcodeproj` on XCode, and run the build.
-Building automatically builds rust crates and bundles web files in `./main`.
-
-### Android
-
-To build for Android, you need to install [cargo-ndk](https://github.com/bbqsrc/cargo-ndk#installation) first:
-
-```sh
-cargo install cargo-ndk
-```
-
-Then open the Android project in Android Studio and run the build. This automatically builds rust crates and bundles necessary web files.
+Данный форк продолжает развиваться с фокусом на максимальный комфорт рабочего процесса для мобильного использования. 
