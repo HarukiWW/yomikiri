@@ -280,6 +280,68 @@ jobs:
           print("dark theme OK")
           PY
 
+      - name: Patch Svelte (Russian settings UI, dark cards, no dictionary update, build version)
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+
+          root = pathlib.Path("src/main/src/components/options")
+          build = os.environ["BUILD_NUMBER"]
+
+          def patch(rel, pairs):
+              p = root / rel
+              s = p.read_text()
+              for old, new in pairs:
+                  assert s.count(old) == 1, rel + ": not found exactly once: " + old
+                  s = s.replace(old, new)
+              p.write_text(s)
+
+          # dark cards
+          patch("GroupedOptions.svelte", [("background-color: white;", "background-color: var(--background);")])
+
+          # no dictionary section (and no way to replace the Russian dictionary)
+          (root / "groups/GroupDictionary.svelte").write_text('<script lang="ts">\n</script>\n')
+
+          patch("groups/GroupAbout.svelte", [
+              ('title="About"', 'title="О программе"'),
+              ('title="About Yomikiri"', 'title="О Yomikiri"'),
+              ('return "v" + versionInfo.version;', 'return "v" + versionInfo.version + "-ru.' + build + '";'),
+              ("Loading version.", "Загрузка версии."),
+              ('title="Third party licenses"', 'title="Лицензии третьих сторон"'),
+              ('buttonText={"View"}', 'buttonText={"Открыть"}'),
+              ("View licenses for third party open source libraries & resources", "Лицензии сторонних библиотек и ресурсов с открытым кодом"),
+              ('title="View source code"', 'title="Исходный код"'),
+              ("https://github.com/bluegreenmagick/yomikiri", "https://github.com/HarukiWW/yomikiri"),
+              ("Yomikiri is an open source project! You can view the code on GitHub.", "Yomikiri — проект с открытым исходным кодом. Код можно посмотреть на GitHub."),
+          ])
+
+          patch("groups/GroupAnki.svelte", [
+              ('title="Use Anki"', 'title="Использовать Anki"'),
+              ("Connecting to Anki...", "Подключение к Anki..."),
+              ("Successfully connected to Anki.", "Успешно подключено к Anki."),
+              ("</a> app is not installed.", "</a> не установлен."),
+              ("</a> is a flashcard app.", "</a> — приложение для карточек."),
+              ('title="Configure Anki template"', 'title="Настроить шаблон Anki"'),
+              ('buttonText="Configure"', 'buttonText="Настроить"'),
+              ('title="Reopen Safari after adding Anki note"', 'title="Возвращаться в Safari после добавления заметки"'),
+              ("If disabled, you can manually return to Safari by clicking", "Если выключено, вернуться в Safari можно вручную, нажав"),
+              ("on top left corner of the screen", "в левом верхнем углу экрана"),
+          ])
+
+          patch("groups/GroupAppearance.svelte", [
+              ('title="Appearance"', 'title="Внешний вид"'),
+              ('title="Font size"', 'title="Размер шрифта"'),
+              ("Text size (px)", "Размер текста (px)"),
+              ('title="Japanese Font"', 'title="Японский шрифт"'),
+              ("For Japanese text only", "Только для японского текста"),
+              ('title="Tooltip max height"', 'title="Максимальная высота подсказки"'),
+              ("Maximum height of dictionary tooltip (px)", "Максимальная высота окна словаря (px)"),
+          ])
+          print("svelte patch OK")
+          PY
+
       - name: Pre-generate files that Xcode expects to already exist
         working-directory: src
         run: |
@@ -319,6 +381,9 @@ jobs:
           echo "App: $APP"
           mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
+          PLIST="ipa/Payload/$(basename "$APP")/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Yomikiri-RU" "$PLIST" || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Yomikiri-RU" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Yomikiri-RU" "$PLIST" || true
           find ipa/Payload \( -name "*.appex" -o -name "*.framework" -o -name "*.app" \) -print0 | xargs -0 -I{} codesign --remove-signature "{}" || true
           (cd ipa && zip -qry ../Yomikiri-RU-v035.ipa Payload)
           ls -la Yomikiri-RU-v035.ipa
