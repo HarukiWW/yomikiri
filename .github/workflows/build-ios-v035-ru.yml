@@ -91,7 +91,7 @@ jobs:
           set -euo pipefail
           ORIG=src/crates/yomikiri-dictionary-generator/jmdict/jmdict_english.xml
           ls -la "$ORIG"
-          ZIP=$(ls ours/custom-dict/*.zip | head -n1)
+          ZIP=$(ls ours/custom-dict/jp-ru-*.zip | head -n1)
           python3 ours/custom-dict/kolobok_to_jmdict.py "$ZIP" /tmp/jmdict_ru.xml --orig "$ORIG"
           mv /tmp/jmdict_ru.xml "$ORIG"
           ls -la "$ORIG"
@@ -340,6 +340,188 @@ jobs:
               ("Maximum height of dictionary tooltip (px)", "Максимальная высота окна словаря (px)"),
           ])
           print("svelte patch OK")
+          PY
+
+      - name: Patch frequency dictionaries (Jiten) into the lookup tooltip
+        run: |
+          python3 - <<'PY'
+          import base64, glob, json, pathlib, struct, zipfile
+
+          # ---------- 1. build binary tables from Yomitan frequency dictionaries ----------
+          def fnv(s):
+              h = 0x811C9DC5
+              b = s.encode("utf-16-le")
+              for i in range(0, len(b), 2):
+                  h ^= b[i] | (b[i + 1] << 8)
+                  h = (h * 0x01000193) & 0xFFFFFFFF
+              return h
+
+          dicts = []
+          for path in sorted(glob.glob("ours/custom-dict/jiten_freq_*.zip")):
+              z = zipfile.ZipFile(path)
+              title = json.loads(z.read("index.json"))["title"]
+              best = {}
+              for name in sorted(n for n in z.namelist() if n.startswith("term_meta_bank_")):
+                  for term, kind, data in json.loads(z.read(name)):
+                      if kind != "freq":
+                          continue
+                      if "reading" in data:
+                          key = fnv(term + "|" + data["reading"])
+                          freq = data["frequency"]
+                      else:
+                          key = fnv(term)
+                          freq = data
+                      rank = freq["value"] if isinstance(freq, dict) else int(freq)
+                      kana = isinstance(freq, dict) and str(freq.get("displayValue", "")).endswith("\u32d5")
+                      slot = best.setdefault(key, [0, 0])
+                      i = 1 if kana else 0
+                      if slot[i] == 0 or rank < slot[i]:
+                          slot[i] = rank
+              flat = []
+              for key in sorted(best):
+                  flat += [key, best[key][0], best[key][1]]
+              blob = struct.pack("<%dI" % len(flat), *flat)
+              dicts.append({"name": title, "data": base64.b64encode(blob).decode("ascii")})
+              print("frequency dictionary:", title, len(best), "keys")
+
+          bg = pathlib.Path("src/main/src/extension/background")
+          data_ts = "export const FREQ_DICTS: { name: string; data: string }[] = " + json.dumps(dicts) + ";\n"
+          (bg / "frequencyData.ts").write_text(data_ts)
+
+          # ---------- 2. background: lookup by binary search ----------
+          (bg / "frequency.ts").write_text('''import { handleMessage } from "extension/browserApi";
+          import { FREQ_DICTS } from "./frequencyData";
+
+          interface FreqTable {
+            name: string;
+            data: Uint32Array;
+          }
+
+          let tables: FreqTable[] | undefined;
+
+          function decode(b64: string): Uint32Array {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return new Uint32Array(bytes.buffer);
+          }
+
+          function hash(s: string): number {
+            let h = 0x811c9dc5;
+            for (let i = 0; i < s.length; i++) {
+              h ^= s.charCodeAt(i);
+              h = Math.imul(h, 0x01000193);
+            }
+            return h >>> 0;
+          }
+
+          /** Returns index of the record (3 numbers: key, rank, kana rank) */
+          function find(t: Uint32Array, key: number): number | undefined {
+            let lo = 0;
+            let hi = t.length / 3 - 1;
+            while (lo <= hi) {
+              const mid = (lo + hi) >>> 1;
+              const k = t[mid * 3];
+              if (k === key) return mid * 3;
+              if (k < key) lo = mid + 1;
+              else hi = mid - 1;
+            }
+            return undefined;
+          }
+
+          export interface FrequencyRequest {
+            term: string;
+            reading: string;
+          }
+
+          export interface FrequencyResult {
+            name: string;
+            /** e.g. ["1065\u32d5", "59854"] */
+            values: string[];
+          }
+
+          function lookup(req: FrequencyRequest): FrequencyResult[] {
+            if (tables === undefined) {
+              tables = FREQ_DICTS.map((d) => ({ name: d.name, data: decode(d.data) }));
+            }
+            const results: FrequencyResult[] = [];
+            for (const t of tables) {
+              const i =
+                find(t.data, hash(req.term + "|" + req.reading)) ??
+                find(t.data, hash(req.term));
+              if (i !== undefined) {
+                const items: [number, string][] = [];
+                if (t.data[i + 1] > 0) items.push([t.data[i + 1], String(t.data[i + 1])]);
+                if (t.data[i + 2] > 0) items.push([t.data[i + 2], t.data[i + 2] + "\u32d5"]);
+                items.sort((a, b) => a[0] - b[0]);
+                results.push({ name: t.name, values: items.map((x) => x[1]) });
+              }
+            }
+            return results;
+          }
+
+          // @ts-expect-error -- key is added to MessageMap by build patch
+          handleMessage("frequency", lookup);
+          ''')
+
+          # ---------- 3. register in background entry + message map ----------
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          p = bg / "index.ts"
+          s = p.read_text()
+          s = replace_once(s, 'import { AnkiApi, type DesktopAnkiApi } from "@platform/anki";',
+                           'import { AnkiApi, type DesktopAnkiApi } from "@platform/anki";\nimport "./frequency";', "bg import")
+          p.write_text(s)
+
+          # ---------- 4. badges in the dictionary entry ----------
+          p = pathlib.Path("src/main/src/components/dictionary/Badges.svelte")
+          s = p.read_text()
+          s = replace_once(s, 'import { type Entry, isCommonEntry } from "lib/dicEntry";',
+                           'import {\n    type Entry,\n    isCommonEntry,\n    getMainForm,\n    getReadingForForm,\n  } from "lib/dicEntry";', "badges import")
+          s = replace_once(s, '  let hasBadges: boolean;\n',
+          '''  let hasBadges: boolean;
+            let freqs: { name: string; values: string[] }[] = [];
+            let requestId = 0;
+
+            function loadFrequencies(entry: Entry): void {
+              freqs = [];
+              if (entry.type !== "word") return;
+              // eslint-disable-next-line
+              const rt = (globalThis as any).chrome?.runtime;
+              if (rt === undefined || typeof rt.sendMessage !== "function") return;
+              const term = getMainForm(entry);
+              const reading = getReadingForForm(entry, term, false).reading;
+              const id = ++requestId;
+              const send = (retry: boolean) => {
+                // eslint-disable-next-line
+                rt.sendMessage({ key: "frequency", request: { term, reading } }, (resp: any) => {
+                  void rt.lastError;
+                  if (id !== requestId) return;
+                  if (resp === undefined && retry) {
+                    setTimeout(() => send(false), 1000);
+                  } else if (resp?.success === true && Array.isArray(resp.resp)) {
+                    freqs = resp.resp;
+                  }
+                });
+              };
+              send(true);
+            }
+          ''', "badges vars")
+          s = replace_once(s, '  $: hasBadges = isCommon || isName;', '  $: hasBadges = isCommon || isName || freqs.length > 0;\n  $: loadFrequencies(entry);', "badges reactive")
+          s = replace_once(s, '    {#if isName}\n      <div class="badge name">name</div>\n    {/if}\n',
+                           '    {#if isName}\n      <div class="badge name">name</div>\n    {/if}\n    {#each freqs as f}\n      <div class="badge freq">{f.name}: {f.values.join(", ")}</div>\n    {/each}\n', "badges markup")
+          s = replace_once(s, '  .name {\n    --badge-color: #d3a7d7;\n  }\n', '  .name {\n    --badge-color: #d3a7d7;\n  }\n\n  .freq {\n    --badge-color: #8fb4d9;\n  }\n', "badges css")
+          p.write_text(s)
+
+          # ---------- 5. message map ----------
+          p = pathlib.Path("src/main/src/extension/browserApi.ts")
+          s = p.read_text()
+          s = replace_once(s, '  getDictMetadata: [void, DictionaryMetadata];\n',
+                           '  getDictMetadata: [void, DictionaryMetadata];\n  frequency: [\n    { term: string; reading: string },\n    { name: string; values: string[] }[],\n  ];\n', "message map")
+          p.write_text(s)
+          print("frequency patch OK")
           PY
 
       - name: Pre-generate files that Xcode expects to already exist
