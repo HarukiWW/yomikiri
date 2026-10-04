@@ -592,6 +592,8 @@ jobs:
           (ext / "stats.ts").write_text("""import { browserStorage } from "extension/browserApi";
 
           export const STATS_KEY = "stats:v1";
+          /** hashes of already counted sentences are kept in 256 buckets */
+          const SEEN_PREFIX = "stats:seen:";
 
           export interface DayStats {
             /** unique words (dictionary form) mined that day */
@@ -602,17 +604,32 @@ jobs:
             read: number;
             /** seconds spent reading */
             time?: number;
+            /** sentences read */
+            sentences?: number;
+            /** words read */
+            words?: number;
           }
 
           export interface StatsData {
             days: Record<string, DayStats>;
           }
 
+          export interface ReadSentence {
+            /** hash of the sentence */
+            h: number;
+            /** characters */
+            c: number;
+            /** words */
+            w: number;
+          }
+
           export interface Summary {
-            words: number;
+            minedWords: number;
             kanji: number;
             read: number;
             time: number;
+            sentences: number;
+            readWords: number;
           }
 
           const KANJI = /[\\u3400-\\u4dbf\\u4e00-\\u9fff]/g;
@@ -638,14 +655,39 @@ jobs:
             });
           }
 
+          function getMany(keys: string[]): Promise<Record<string, number[]>> {
+            return new Promise((resolve) => {
+              browserStorage().get(keys, (obj) => resolve((obj ?? {}) as Record<string, number[]>));
+            });
+          }
+
+          function setMany(values: Record<string, number[]>): Promise<void> {
+            return new Promise((resolve) => {
+              if (Object.keys(values).length === 0) return resolve();
+              browserStorage().set(values, () => resolve());
+            });
+          }
+
+          function bucketKey(hash: number): string {
+            return SEEN_PREFIX + (hash & 255).toString(16).padStart(2, "0");
+          }
+
+          function allBucketKeys(): string[] {
+            const keys: string[] = [];
+            for (let i = 0; i < 256; i++) {
+              keys.push(SEEN_PREFIX + i.toString(16).padStart(2, "0"));
+            }
+            return keys;
+          }
+
           // updates are applied one after another so they never overwrite each other
           let chain: Promise<void> = Promise.resolve();
 
-          function update(fn: (data: StatsData) => void): Promise<void> {
+          function update(fn: (data: StatsData) => void | Promise<void>): Promise<void> {
             chain = chain
               .then(async () => {
                 const data = await loadStats();
-                fn(data);
+                await fn(data);
                 await saveStats(data);
               })
               .catch((e) => console.error("Could not update stats", e));
@@ -689,13 +731,47 @@ jobs:
             });
           }
 
-          export function recordRead(chars: number, seconds: number): Promise<void> {
-            if (!(chars > 0) && !(seconds > 0)) return Promise.resolve();
-            return update((data) => {
+          /** Sentences that were already counted before are ignored. */
+          export function recordReading(
+            sentences: ReadSentence[],
+            seconds: number,
+          ): Promise<void> {
+            if (sentences.length === 0 && !(seconds > 0)) return Promise.resolve();
+            return update(async (data) => {
               const d = today(data);
-              if (chars > 0) d.read += Math.round(chars);
               if (seconds > 0) d.time = (d.time ?? 0) + Math.round(seconds);
+              if (sentences.length === 0) return;
+
+              const keys = Array.from(new Set(sentences.map((s) => bucketKey(s.h))));
+              const buckets = await getMany(keys);
+              const dirty = new Set<string>();
+              for (const s of sentences) {
+                const key = bucketKey(s.h);
+                if (buckets[key] === undefined) buckets[key] = [];
+                if (buckets[key].includes(s.h)) continue;
+                buckets[key].push(s.h);
+                dirty.add(key);
+                d.sentences = (d.sentences ?? 0) + 1;
+                d.read += s.c;
+                d.words = (d.words ?? 0) + s.w;
+              }
+              const changed: Record<string, number[]> = {};
+              dirty.forEach((k) => (changed[k] = buckets[k]));
+              await setMany(changed);
             });
+          }
+
+          /** Deletes all statistics, including the memory of already counted sentences. */
+          export function resetStats(): Promise<void> {
+            chain = chain
+              .then(
+                () =>
+                  new Promise<void>((resolve) => {
+                    browserStorage().remove([STATS_KEY, ...allBucketKeys()], () => resolve());
+                  }),
+              )
+              .catch((e) => console.error("Could not reset stats", e));
+            return chain;
           }
 
           function dayKeys(days: number): string[] {
@@ -713,18 +789,19 @@ jobs:
           export function summarize(data: StatsData, days: number | null): Summary {
             const words = new Set<string>();
             const kanji = new Set<string>();
-            let read = 0;
-            let time = 0;
+            const sum = { read: 0, time: 0, sentences: 0, readWords: 0 };
             const keys = days === null ? Object.keys(data.days) : dayKeys(days);
             for (const key of keys) {
               const d = data.days[key];
               if (d === undefined) continue;
               d.mined.forEach((w) => words.add(w));
               d.kanji.forEach((k) => kanji.add(k));
-              read += d.read;
-              time += d.time ?? 0;
+              sum.read += d.read;
+              sum.time += d.time ?? 0;
+              sum.sentences += d.sentences ?? 0;
+              sum.readWords += d.words ?? 0;
             }
-            return { words: words.size, kanji: kanji.size, read, time };
+            return { minedWords: words.size, kanji: kanji.size, ...sum };
           }
 
           /** Number of days in a row (up to today) with reading or mining. */
@@ -761,11 +838,11 @@ jobs:
           }
           """)
 
-          # ---------- background: receives 'chars read' from content scripts ----------
+          # ---------- background: receives read sentences from content scripts ----------
           (ext / "background/statsHandlers.ts").write_text("""import { handleMessage } from "extension/browserApi";
-          import { recordRead } from "extension/stats";
+          import { recordReading } from "extension/stats";
 
-          handleMessage("statsRead", (req) => recordRead(req.chars, req.seconds));
+          handleMessage("statsRead", (req) => recordReading(req.sentences, req.seconds));
           """)
 
           p = ext / "background/index.ts"
@@ -776,7 +853,7 @@ jobs:
           p = ext / "browserApi.ts"
           s = p.read_text()
           s = replace_once(s, "  getDictMetadata: [void, DictionaryMetadata];\n",
-                           "  getDictMetadata: [void, DictionaryMetadata];\n  statsRead: [{ chars: number; seconds: number }, void];\n", "message map")
+                           "  getDictMetadata: [void, DictionaryMetadata];\n  statsRead: [\n    { sentences: { h: number; c: number; w: number }[]; seconds: number },\n    void,\n  ];\n", "message map")
           p.write_text(s)
 
           # ---------- mined words: record when a note is added ----------
@@ -788,79 +865,215 @@ jobs:
                            "  async function _addNote(note: AnkiNote): Promise<boolean> {\n    try {\n      await recordMinedNote(note);\n    } catch (e) {\n      console.error(e);\n    }\n", "add note")
           p.write_text(s)
 
-          # ---------- reading counter (content script, top frame only) ----------
+          # ---------- smart reading counter (content script, top frame only) ----------
           (ext / "content/readingStats.ts").write_text("""/**
-           * Counts Japanese characters the reader has actually read.
+           * Smart reading counter.
            *
-           * A block of text is credited only when it has been passed by scrolling
-           * (it left the screen at the top), and only for the time it was really
-           * on screen while the user was active. Scrolling quickly through text
-           * credits (almost) nothing, and a page left open credits nothing.
+           * The page text is split into sentences. A sentence counts as read when
+           *  - it was on screen for at least 10 seconds (while the user was active), and
+           *  - the reading speed over the whole page is realistic: credit is taken from a
+           *    bucket that fills at READ_CPS characters per second, so a full screen
+           *    cannot be credited just because 10 seconds have passed.
+           * Interface text (menus, headers, buttons, links, fixed bars) is ignored.
+           * The same sentence is counted only once (the background script remembers it).
            */
           const JP = /[\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff]/g;
+          const HAS_JP = /[\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff]/;
           const BLOCKS = "p, li, h1, h2, h3, h4, h5, h6, blockquote, dd, dt, td, pre, div";
-          const SKIP = "nav, header, footer, aside, script, style, noscript, [role='navigation']";
-          /** Reading faster than this many characters per second counts as skimming. */
-          const READ_CPS = 12;
-          /** No touch or scroll for this long: the user is not reading. */
+          const SKIP =
+            "nav, header, footer, aside, button, a, form, select, label, summary, script, style, noscript, " +
+            "[role='navigation'], [role='button'], [role='menu'], [role='menuitem'], [role='tab']";
+          const SENTENCE_RE = /[^。！？!?\\n]*[。！？!?]+[」』）)”]*|[^。！？!?\\n]+/g;
+          const MIN_ON_SCREEN_MS = 10000;
+          const READ_CPS = 15;
+          const BUCKET_MAX = 150;
+          const MIN_CHARS = 4;
+          const MAX_SENTENCES_PER_BLOCK = 3000;
           const IDLE_MS = 45000;
           const FLUSH_MS = 10000;
 
-          function jpChars(el: Element): number {
-            return el.textContent?.match(JP)?.length ?? 0;
+          interface Sentence {
+            text: string;
+            start: number;
+            end: number;
+            hash: number;
+            chars: number;
+            ms: number;
+            done: boolean;
+            queued: boolean;
+          }
+
+          interface Block {
+            nodes: { node: Text; start: number }[];
+            sentences: Sentence[];
+          }
+
+          function fnv(s: string): number {
+            let h = 0x811c9dc5;
+            for (let i = 0; i < s.length; i++) {
+              h ^= s.charCodeAt(i);
+              h = Math.imul(h, 0x01000193);
+            }
+            return h >>> 0;
+          }
+
+          // eslint-disable-next-line
+          const segmenter: any =
+            typeof Intl !== "undefined" && "Segmenter" in Intl
+              ? // eslint-disable-next-line
+                new (Intl as any).Segmenter("ja", { granularity: "word" })
+              : undefined;
+
+          function countWords(text: string, chars: number): number {
+            if (segmenter === undefined) return Math.max(1, Math.round(chars / 1.7));
+            let n = 0;
+            // eslint-disable-next-line
+            for (const seg of segmenter.segment(text) as Iterable<{ isWordLike?: boolean }>) {
+              if (seg.isWordLike === true) n++;
+            }
+            return Math.max(1, n);
+          }
+
+          function isInterface(el: Element): boolean {
+            if (el.closest(SKIP) !== null) return true;
+            for (let n: Element | null = el; n !== null && n !== document.body; n = n.parentElement) {
+              const pos = getComputedStyle(n).position;
+              if (pos === "fixed" || pos === "sticky") return true;
+            }
+            return false;
+          }
+
+          function buildBlock(el: Element): Block | null {
+            const nodes: { node: Text; start: number }[] = [];
+            let text = "";
+            const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+              acceptNode: (n) =>
+                n.parentElement?.closest("rt, rp, script, style, noscript") != null
+                  ? NodeFilter.FILTER_REJECT
+                  : NodeFilter.FILTER_ACCEPT,
+            });
+            for (let n = walker.nextNode(); n !== null; n = walker.nextNode()) {
+              nodes.push({ node: n as Text, start: text.length });
+              text += (n as Text).data;
+            }
+            const sentences: Sentence[] = [];
+            for (const m of text.matchAll(SENTENCE_RE)) {
+              const raw = m[0];
+              const chars = raw.match(JP)?.length ?? 0;
+              if (chars < MIN_CHARS) continue;
+              const start = m.index ?? 0;
+              sentences.push({
+                text: raw,
+                start,
+                end: start + raw.length,
+                hash: fnv(raw.replace(/\\s+/g, "")),
+                chars,
+                ms: 0,
+                done: false,
+                queued: false,
+              });
+              if (sentences.length >= MAX_SENTENCES_PER_BLOCK) break;
+            }
+            return sentences.length === 0 ? null : { nodes, sentences };
+          }
+
+          function locate(block: Block, pos: number): { node: Text; offset: number } {
+            const nodes = block.nodes;
+            let lo = 0;
+            let hi = nodes.length - 1;
+            while (lo < hi) {
+              const mid = (lo + hi + 1) >> 1;
+              if (nodes[mid].start <= pos) lo = mid;
+              else hi = mid - 1;
+            }
+            const n = nodes[lo];
+            return { node: n.node, offset: Math.min(pos - n.start, n.node.data.length) };
+          }
+
+          function rectOf(block: Block, s: Sentence): DOMRect | null {
+            try {
+              const a = locate(block, s.start);
+              const b = locate(block, s.end - 1);
+              const range = document.createRange();
+              range.setStart(a.node, a.offset);
+              range.setEnd(b.node, Math.min(b.offset + 1, b.node.data.length));
+              const r = range.getBoundingClientRect();
+              return r.width === 0 && r.height === 0 ? null : r;
+            } catch (_e) {
+              return null;
+            }
+          }
+
+          function mostlyOnScreen(r: DOMRect): boolean {
+            const w = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+            const h = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+            return (w * h) / Math.max(1, r.width * r.height) >= 0.8;
+          }
+
+          function eachVisibleSentence(block: Block, fn: (s: Sentence, r: DOMRect) => void): void {
+            const list = block.sentences;
+            let i = 0;
+            if (list.length > 30) {
+              // binary search: first sentence that is not above the screen
+              let lo = 0;
+              let hi = list.length;
+              while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                const r = rectOf(block, list[mid]);
+                if (r !== null && r.bottom <= 0) lo = mid + 1;
+                else hi = mid;
+              }
+              i = lo;
+            }
+            for (; i < list.length; i++) {
+              const r = rectOf(block, list[i]);
+              if (r === null) continue;
+              if (r.top >= window.innerHeight) break;
+              if (r.bottom <= 0) continue;
+              fn(list[i], r);
+            }
           }
 
           function start(): void {
-            const seen = new WeakSet<Element>();
-            const total = new WeakMap<Element, number>();
-            const shownMs = new WeakMap<Element, number>();
-            const done = new WeakSet<Element>();
-            const visible = new Set<Element>();
-            let pending = 0;
+            const blocks = new WeakMap<Element, Block>();
+            const rejected = new WeakSet<Element>();
+            const visible = new Set<Block>();
+            const counted = new Set<number>();
+            let queue: Sentence[] = [];
+            let outbox: { h: number; c: number; w: number }[] = [];
+            let bucket = 0;
             let pendingMs = 0;
             let lastActive = Date.now();
             let lastTick = Date.now();
 
-            function credit(el: Element): void {
-              if (done.has(el)) return;
-              done.add(el);
-              visible.delete(el);
-              const chars = total.get(el) ?? 0;
-              if (chars === 0) return;
-              const needed = (chars / READ_CPS) * 1000;
-              const shown = shownMs.get(el) ?? 0;
-              pending += chars * Math.min(1, shown / needed);
-            }
-
             const io = new IntersectionObserver(
               (entries) => {
                 for (const e of entries) {
-                  const el = e.target;
-                  if (!e.isIntersecting) {
-                    visible.delete(el);
-                    // left the screen at the top: the text was passed
-                    if (e.boundingClientRect.bottom <= 0) credit(el);
-                    continue;
-                  }
-                  const enough =
-                    e.intersectionRatio >= 0.3 ||
-                    e.intersectionRect.height >= window.innerHeight * 0.3;
-                  if (enough) visible.add(el);
-                  else visible.delete(el);
+                  const block = blocks.get(e.target);
+                  if (block === undefined) continue;
+                  if (e.isIntersecting) visible.add(block);
+                  else visible.delete(block);
                 }
               },
-              { threshold: [0, 0.3, 0.6, 1] },
+              { threshold: 0 },
             );
 
             function scan(): void {
               for (const el of Array.from(document.querySelectorAll(BLOCKS))) {
-                if (seen.has(el)) continue;
+                if (blocks.has(el) || rejected.has(el)) continue;
                 if (el.querySelector(BLOCKS) !== null) continue;
-                if (el.closest(SKIP) !== null) continue;
-                const n = jpChars(el);
-                if (n === 0) continue;
-                seen.add(el);
-                total.set(el, n);
+                const text = el.textContent;
+                if (text === null || !HAS_JP.test(text)) continue;
+                if (isInterface(el)) {
+                  rejected.add(el);
+                  continue;
+                }
+                const block = buildBlock(el);
+                if (block === null) {
+                  rejected.add(el);
+                  continue;
+                }
+                blocks.set(el, block);
                 io.observe(el);
               }
             }
@@ -871,18 +1084,26 @@ jobs:
               scanTimer = window.setTimeout(() => {
                 scanTimer = undefined;
                 scan();
-              }, 1500);
+              }, 3000);
+            }
+
+            function credit(s: Sentence): void {
+              s.done = true;
+              s.queued = false;
+              if (counted.has(s.hash)) return;
+              counted.add(s.hash);
+              outbox.push({ h: s.hash, c: s.chars, w: countWords(s.text, s.chars) });
             }
 
             function flush(): void {
-              const chars = Math.floor(pending);
               const seconds = Math.floor(pendingMs / 1000);
-              if (chars < 1 && seconds < 1) return;
-              pending -= chars;
+              if (outbox.length === 0 && seconds < 1) return;
+              const sentences = outbox;
+              outbox = [];
               pendingMs -= seconds * 1000;
               try {
                 chrome.runtime.sendMessage(
-                  { key: "statsRead", request: { chars, seconds } },
+                  { key: "statsRead", request: { sentences, seconds } },
                   () => void chrome.runtime.lastError,
                 );
               } catch (_e) {
@@ -890,14 +1111,7 @@ jobs:
               }
             }
 
-            const touch = () => {
-              lastActive = Date.now();
-            };
-            for (const ev of ["scroll", "touchstart", "touchmove", "pointerdown", "keydown", "click"]) {
-              window.addEventListener(ev, touch, { passive: true, capture: true });
-            }
-
-            window.setInterval(() => {
+            function tick(): void {
               const now = Date.now();
               const dt = Math.min(now - lastTick, 2000);
               lastTick = now;
@@ -909,11 +1123,44 @@ jobs:
                 return;
               }
               pendingMs += dt;
-              for (const el of visible) {
-                shownMs.set(el, (shownMs.get(el) ?? 0) + dt);
-              }
-            }, 1000);
+              bucket = Math.min(BUCKET_MAX, bucket + (dt / 1000) * READ_CPS);
 
+              const onScreen = new Set<Sentence>();
+              for (const block of visible) {
+                eachVisibleSentence(block, (s, r) => {
+                  if (s.done || !mostlyOnScreen(r)) return;
+                  onScreen.add(s);
+                  s.ms += dt;
+                  if (s.ms >= MIN_ON_SCREEN_MS && !s.queued) {
+                    s.queued = true;
+                    queue.push(s);
+                  }
+                });
+              }
+
+              // sentences that left the screen before being credited are dropped
+              queue = queue.filter((s) => {
+                if (onScreen.has(s)) return true;
+                s.queued = false;
+                return false;
+              });
+              while (queue.length > 0) {
+                const s = queue[0];
+                if (bucket < Math.min(s.chars, BUCKET_MAX)) break;
+                queue.shift();
+                bucket = Math.max(0, bucket - s.chars);
+                credit(s);
+              }
+            }
+
+            const touch = () => {
+              lastActive = Date.now();
+            };
+            for (const ev of ["scroll", "touchstart", "touchmove", "pointerdown", "keydown", "click"]) {
+              window.addEventListener(ev, touch, { passive: true, capture: true });
+            }
+
+            window.setInterval(tick, 1000);
             window.setInterval(flush, FLUSH_MS);
             document.addEventListener("visibilitychange", () => {
               if (document.visibilityState === "hidden") flush();
@@ -962,11 +1209,14 @@ jobs:
               summarize,
               streak,
               lastDays,
+              resetStats,
               STATS_KEY,
               type StatsData,
             } from "extension/stats";
 
             let data: StatsData = { days: {} };
+            let confirmReset = false;
+            let confirmTimer: number | undefined;
 
             async function refresh(): Promise<void> {
               data = await loadStats();
@@ -985,9 +1235,18 @@ jobs:
               chrome.storage.onChanged.removeListener(onChange);
             });
 
+            function onReset(): void {
+              if (!confirmReset) {
+                confirmReset = true;
+                confirmTimer = window.setTimeout(() => (confirmReset = false), 5000);
+                return;
+              }
+              window.clearTimeout(confirmTimer);
+              confirmReset = false;
+              void resetStats().then(refresh);
+            }
+
             const fmt = (n: number) => n.toLocaleString("ru-RU");
-            /** about 1.7 characters per word in running Japanese text */
-            const words = (chars: number) => Math.round(chars / 1.7);
 
             function fmtTime(seconds: number): string {
               const minutes = Math.round(seconds / 60);
@@ -1032,7 +1291,7 @@ jobs:
                 <tr>
                   <td>Слов в Anki</td>
                   {#each columns as c}
-                    <td>{fmt(c.s.words)}</td>
+                    <td>{fmt(c.s.minedWords)}</td>
                   {/each}
                 </tr>
                 <tr>
@@ -1042,15 +1301,21 @@ jobs:
                   {/each}
                 </tr>
                 <tr>
-                  <td>Прочитано, знаков</td>
+                  <td>Прочитано предложений</td>
                   {#each columns as c}
-                    <td>{fmt(c.s.read)}</td>
+                    <td>{fmt(c.s.sentences)}</td>
                   {/each}
                 </tr>
                 <tr>
-                  <td>Прочитано, ≈ слов</td>
+                  <td>Прочитано слов</td>
                   {#each columns as c}
-                    <td>{fmt(words(c.s.read))}</td>
+                    <td>{fmt(c.s.readWords)}</td>
+                  {/each}
+                </tr>
+                <tr>
+                  <td>Прочитано знаков</td>
+                  {#each columns as c}
+                    <td>{fmt(c.s.read)}</td>
                   {/each}
                 </tr>
                 <tr>
@@ -1087,6 +1352,10 @@ jobs:
               {/each}
             </div>
             <div class="hint">Под днём: слов добавлено в Anki</div>
+
+            <button class="reset" class:confirm={confirmReset} on:click={onReset}>
+              {confirmReset ? "Нажмите ещё раз: удалить всё" : "Сбросить статистику"}
+            </button>
           </div>
 
           <style>
@@ -1188,6 +1457,24 @@ jobs:
               margin-top: 0.4em;
               color: var(--text-faint);
               font-size: 0.75em;
+            }
+
+            .reset {
+              display: block;
+              width: 100%;
+              margin-top: 1.4em;
+              padding: 0.7em 1em;
+              text-align: center;
+              border: 1px solid var(--border);
+              border-radius: 0.5em;
+              color: var(--text-warn);
+              font-size: 0.9em;
+            }
+
+            .reset.confirm {
+              background-color: var(--text-warn);
+              border-color: var(--text-warn);
+              color: #ffffff;
             }
           </style>
           """)
