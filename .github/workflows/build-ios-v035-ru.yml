@@ -210,7 +210,7 @@ jobs:
           # settings saved in the app. Stored settings still override these defaults.
           import json
           DEFAULT_TEMPLATE = {
-              "deck": "yomikiri",
+              "deck": "mining",
               "notetype": "kaishi mining",
               "tags": "yomikiri-ru",
               "fields": [
@@ -233,6 +233,7 @@ jobs:
           assert s.count(old) == 1, "default anki options not found in config.ts"
           tpl_ts = json.dumps(template, indent=2, ensure_ascii=False).replace("\n", "\n  ")
           s = s.replace(old, '  "anki.anki_template": ' + tpl_ts + ',\n  "anki.enabled": true,')
+          s = replace_once(s, '  "general.font_size": 14,', '  "general.font_size": 11,', "default font size")
           p.write_text(s)
 
           # translate.ts: translate sentences into Russian instead of English
@@ -307,7 +308,7 @@ jobs:
           patch("groups/GroupAbout.svelte", [
               ('title="About"', 'title="О программе"'),
               ('title="About Yomikiri"', 'title="О Yomikiri"'),
-              ('return "v" + versionInfo.version;', 'return "v" + versionInfo.version + "-ru.' + build + '";'),
+              ('return "v" + versionInfo.version;', 'return "1.0 beta(' + build + ')";'),
               ("Loading version.", "Загрузка версии."),
               ('title="Third party licenses"', 'title="Лицензии третьих сторон"'),
               ('buttonText={"View"}', 'buttonText={"Открыть"}'),
@@ -460,7 +461,6 @@ jobs:
             return results;
           }
 
-          // @ts-expect-error -- key is added to MessageMap by build patch
           handleMessage("frequency", lookup);
           ''')
 
@@ -524,6 +524,494 @@ jobs:
           print("frequency patch OK")
           PY
 
+      - name: Patch toolbar (zoom buttons A- / A+ in the lookup window)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          p = pathlib.Path("src/main/src/components/dictionary/Toolbar.svelte")
+          s = p.read_text()
+
+          def rep(old, new):
+              global s
+              assert s.count(old) == 1, "toolbar: not found exactly once: " + old
+              s = s.replace(old, new)
+
+          rep('  import IconClose from "@icons/close.svg";\n',
+              '  import IconClose from "@icons/close.svg";\n  import { Config } from "lib/config";\n')
+          rep('  export let changeSelectedTool: (tool: Tools) => void;\n',
+          '''  export let changeSelectedTool: (tool: Tools) => void;
+
+            /** Change UI scale. Saved to config, so it is remembered. */
+            async function changeSize(delta: number): Promise<void> {
+              const config = await Config.instance.get();
+              const size = config.get("general.font_size");
+              await config.set("general.font_size", Math.min(24, Math.max(8, size + delta)));
+            }
+          ''')
+          rep('''    {#if tooltipMode}
+                <button
+                  class="tool-button"
+                  title="Close"''', '''    {#if tooltipMode}
+                <button
+                  class="tool-button text-button"
+                  title="Уменьшить масштаб"
+                  on:click={() => void changeSize(-1)}
+                >
+                  A−
+                </button>
+                <button
+                  class="tool-button text-button"
+                  title="Увеличить масштаб"
+                  on:click={() => void changeSize(1)}
+                >
+                  A+
+                </button>
+                <button
+                  class="tool-button"
+                  title="Закрыть"''')
+          rep('title="Translate sentence"', 'title="Перевести предложение"')
+          rep('title="Grammar"', 'title="Грамматика"')
+          rep('  .icon {\n    fill: #000000;', '  .text-button {\n    color: #000000;\n    font-weight: bold;\n    white-space: nowrap;\n  }\n\n  .icon {\n    fill: #000000;')
+          p.write_text(s)
+          print("toolbar patch OK")
+          PY
+
+      - name: Patch statistics (mined words, kanji, reading counter, popup view)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          ext = pathlib.Path("src/main/src/extension")
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          # ---------- storage + summary logic (runs in background and popup) ----------
+          (ext / "stats.ts").write_text("""import { browserStorage } from "extension/browserApi";
+
+          export const STATS_KEY = "stats:v1";
+
+          export interface DayStats {
+            /** unique words (dictionary form) mined that day */
+            mined: string[];
+            /** unique kanji in those words */
+            kanji: string[];
+            /** Japanese characters read */
+            read: number;
+          }
+
+          export interface StatsData {
+            days: Record<string, DayStats>;
+          }
+
+          export interface Summary {
+            words: number;
+            kanji: number;
+            read: number;
+          }
+
+          const KANJI = /[\\u3400-\\u4dbf\\u4e00-\\u9fff]/g;
+
+          export function localDate(d: Date = new Date()): string {
+            const m = String(d.getMonth() + 1).padStart(2, "0");
+            const day = String(d.getDate()).padStart(2, "0");
+            return d.getFullYear() + "-" + m + "-" + day;
+          }
+
+          export function loadStats(): Promise<StatsData> {
+            return new Promise((resolve) => {
+              browserStorage().get(STATS_KEY, (obj) => {
+                const v = obj?.[STATS_KEY] as StatsData | undefined;
+                resolve(v !== undefined && v.days !== undefined ? v : { days: {} });
+              });
+            });
+          }
+
+          function saveStats(data: StatsData): Promise<void> {
+            return new Promise((resolve) => {
+              browserStorage().set({ [STATS_KEY]: data }, () => resolve());
+            });
+          }
+
+          // updates are applied one after another so they never overwrite each other
+          let chain: Promise<void> = Promise.resolve();
+
+          function update(fn: (data: StatsData) => void): Promise<void> {
+            chain = chain
+              .then(async () => {
+                const data = await loadStats();
+                fn(data);
+                await saveStats(data);
+              })
+              .catch((e) => console.error("Could not update stats", e));
+            return chain;
+          }
+
+          function today(data: StatsData): DayStats {
+            const key = localDate();
+            if (data.days[key] === undefined) {
+              data.days[key] = { mined: [], kanji: [], read: 0 };
+            }
+            return data.days[key];
+          }
+
+          /** Dictionary form of the mined word, from the note's fields. */
+          export function wordFromNote(note: {
+            fields: { name: string; value: string }[];
+          }): string {
+            const field =
+              note.fields.find((f) => f.name === "Furigana") ??
+              note.fields.find((f) => f.name === "Word") ??
+              note.fields[0];
+            const value = field?.value ?? "";
+            return value
+              .replace(/<[^>]*>/g, "")
+              .replace(/\\[[^\\]]*\\]/g, "")
+              .replace(/\\s+/g, "");
+          }
+
+          export function recordMinedNote(note: {
+            fields: { name: string; value: string }[];
+          }): Promise<void> {
+            const word = wordFromNote(note);
+            if (word === "") return Promise.resolve();
+            return update((data) => {
+              const d = today(data);
+              if (!d.mined.includes(word)) d.mined.push(word);
+              for (const k of word.match(KANJI) ?? []) {
+                if (!d.kanji.includes(k)) d.kanji.push(k);
+              }
+            });
+          }
+
+          export function recordRead(chars: number): Promise<void> {
+            if (!(chars > 0)) return Promise.resolve();
+            return update((data) => {
+              today(data).read += Math.round(chars);
+            });
+          }
+
+          /** `days`: number of last days including today. null: all time. */
+          export function summarize(data: StatsData, days: number | null): Summary {
+            const words = new Set<string>();
+            const kanji = new Set<string>();
+            let read = 0;
+            let keys: string[];
+            if (days === null) {
+              keys = Object.keys(data.days);
+            } else {
+              const now = new Date();
+              keys = [];
+              for (let i = 0; i < days; i++) {
+                keys.push(
+                  localDate(new Date(now.getFullYear(), now.getMonth(), now.getDate() - i)),
+                );
+              }
+            }
+            for (const key of keys) {
+              const d = data.days[key];
+              if (d === undefined) continue;
+              d.mined.forEach((w) => words.add(w));
+              d.kanji.forEach((k) => kanji.add(k));
+              read += d.read;
+            }
+            return { words: words.size, kanji: kanji.size, read };
+          }
+          """)
+
+          # ---------- background: receives 'chars read' from content scripts ----------
+          (ext / "background/statsHandlers.ts").write_text("""import { handleMessage } from "extension/browserApi";
+          import { recordRead } from "extension/stats";
+
+          handleMessage("statsRead", (req) => recordRead(req.chars));
+          """)
+
+          p = ext / "background/index.ts"
+          s = p.read_text()
+          s = replace_once(s, 'import "./frequency";', 'import "./frequency";\nimport "./statsHandlers";', "bg import")
+          p.write_text(s)
+
+          p = ext / "browserApi.ts"
+          s = p.read_text()
+          s = replace_once(s, "  getDictMetadata: [void, DictionaryMetadata];\n",
+                           "  getDictMetadata: [void, DictionaryMetadata];\n  statsRead: [{ chars: number }, void];\n", "message map")
+          p.write_text(s)
+
+          # ---------- mined words: record when a note is added ----------
+          p = ext.parent / "platform/ios/anki.ts"
+          s = p.read_text()
+          s = replace_once(s, 'import { iosAnkiMobileURL } from "../shared/anki";',
+                           'import { iosAnkiMobileURL } from "../shared/anki";\nimport { recordMinedNote } from "extension/stats";', "anki import")
+          s = replace_once(s, "  async function _addNote(note: AnkiNote): Promise<boolean> {\n",
+                           "  async function _addNote(note: AnkiNote): Promise<boolean> {\n    try {\n      await recordMinedNote(note);\n    } catch (e) {\n      console.error(e);\n    }\n", "add note")
+          p.write_text(s)
+
+          # ---------- reading counter (content script, top frame only) ----------
+          (ext / "content/readingStats.ts").write_text("""/**
+           * Counts Japanese characters the reader actually had on screen.
+           * Credit is limited to READ_CPS characters per second in total,
+           * so scrolling quickly through a page adds (almost) nothing.
+           */
+          const JP = /[\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff]/g;
+          const BLOCKS = "p, li, h1, h2, h3, h4, h5, h6, blockquote, dd, dt, td, pre, div";
+          const READ_CPS = 15;
+          const IDLE_MS = 120000;
+          const FLUSH_MS = 10000;
+
+          function jpChars(el: Element): number {
+            return el.textContent?.match(JP)?.length ?? 0;
+          }
+
+          function start(): void {
+            const seen = new WeakSet<Element>();
+            const remaining = new WeakMap<Element, number>();
+            const visible = new Set<Element>();
+            let pending = 0;
+            let lastActive = Date.now();
+            let lastTick = Date.now();
+
+            const io = new IntersectionObserver(
+              (entries) => {
+                for (const e of entries) {
+                  const isVisible =
+                    e.isIntersecting &&
+                    (e.intersectionRatio >= 0.5 ||
+                      e.intersectionRect.height >= window.innerHeight * 0.5);
+                  if (isVisible) visible.add(e.target);
+                  else visible.delete(e.target);
+                }
+              },
+              { threshold: [0, 0.25, 0.5, 0.75, 1] },
+            );
+
+            function scan(): void {
+              for (const el of Array.from(document.querySelectorAll(BLOCKS))) {
+                if (seen.has(el)) continue;
+                if (el.querySelector(BLOCKS) !== null) continue;
+                const n = jpChars(el);
+                if (n === 0) continue;
+                seen.add(el);
+                remaining.set(el, n);
+                io.observe(el);
+              }
+            }
+
+            let scanTimer: number | undefined;
+            function scheduleScan(): void {
+              if (scanTimer !== undefined) return;
+              scanTimer = window.setTimeout(() => {
+                scanTimer = undefined;
+                scan();
+              }, 1500);
+            }
+
+            function flush(): void {
+              const n = Math.floor(pending);
+              if (n < 1) return;
+              pending -= n;
+              try {
+                chrome.runtime.sendMessage(
+                  { key: "statsRead", request: { chars: n } },
+                  () => void chrome.runtime.lastError,
+                );
+              } catch (_e) {
+                // extension was reloaded
+              }
+            }
+
+            const touch = () => {
+              lastActive = Date.now();
+            };
+            for (const ev of ["scroll", "touchstart", "touchmove", "pointerdown", "keydown", "click"]) {
+              window.addEventListener(ev, touch, { passive: true, capture: true });
+            }
+
+            window.setInterval(() => {
+              const now = Date.now();
+              const dt = Math.min((now - lastTick) / 1000, 2);
+              lastTick = now;
+              if (document.visibilityState !== "visible" || now - lastActive > IDLE_MS) {
+                return;
+              }
+              let budget = dt * READ_CPS;
+              const list = Array.from(visible).sort(
+                (a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top,
+              );
+              for (const el of list) {
+                if (budget <= 0) break;
+                const rem = remaining.get(el) ?? 0;
+                if (rem <= 0) continue;
+                const take = Math.min(rem, budget);
+                remaining.set(el, rem - take);
+                budget -= take;
+                pending += take;
+              }
+            }, 1000);
+
+            window.setInterval(flush, FLUSH_MS);
+            document.addEventListener("visibilitychange", () => {
+              if (document.visibilityState === "hidden") flush();
+            });
+            window.addEventListener("pagehide", flush);
+
+            scan();
+            new MutationObserver(scheduleScan).observe(document.documentElement, {
+              childList: true,
+              subtree: true,
+            });
+          }
+
+          try {
+            if (
+              window.top === window &&
+              typeof chrome !== "undefined" &&
+              typeof chrome.runtime?.sendMessage === "function"
+            ) {
+              start();
+            }
+          } catch (e) {
+            console.error("Reading stats could not start", e);
+          }
+          """)
+
+          p = ext / "content/index.ts"
+          s = p.read_text()
+          p.write_text('import "./readingStats";\n' + s)
+
+          # ---------- popup: statistics view ----------
+          (ext / "popup/StatsView.svelte").write_text("""<script lang="ts">
+            import { onMount, onDestroy } from "svelte";
+            import {
+              loadStats,
+              summarize,
+              STATS_KEY,
+              type StatsData,
+            } from "extension/stats";
+
+            let data: StatsData = { days: {} };
+
+            async function refresh(): Promise<void> {
+              data = await loadStats();
+            }
+
+            function onChange(changes: Record<string, unknown>): void {
+              if (STATS_KEY in changes) void refresh();
+            }
+
+            onMount(() => {
+              void refresh();
+              chrome.storage.onChanged.addListener(onChange);
+            });
+
+            onDestroy(() => {
+              chrome.storage.onChanged.removeListener(onChange);
+            });
+
+            const fmt = (n: number) => n.toLocaleString("ru-RU");
+            /** about 1.7 characters per word in running Japanese text */
+            const words = (chars: number) => Math.round(chars / 1.7);
+
+            $: columns = [
+              { title: "Сегодня", s: summarize(data, 1) },
+              { title: "7 дней", s: summarize(data, 7) },
+              { title: "Всё время", s: summarize(data, null) },
+            ];
+          </script>
+
+          <div class="stats">
+            <div class="title">Статистика</div>
+            <table>
+              <thead>
+                <tr>
+                  <th></th>
+                  {#each columns as c}
+                    <th>{c.title}</th>
+                  {/each}
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Слов в Anki</td>
+                  {#each columns as c}
+                    <td>{fmt(c.s.words)}</td>
+                  {/each}
+                </tr>
+                <tr>
+                  <td>Кандзи (уник.)</td>
+                  {#each columns as c}
+                    <td>{fmt(c.s.kanji)}</td>
+                  {/each}
+                </tr>
+                <tr>
+                  <td>Прочитано, знаков</td>
+                  {#each columns as c}
+                    <td>{fmt(c.s.read)}</td>
+                  {/each}
+                </tr>
+                <tr>
+                  <td>Прочитано, ≈ слов</td>
+                  {#each columns as c}
+                    <td>{fmt(words(c.s.read))}</td>
+                  {/each}
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <style>
+            .stats {
+              padding: 0.75rem 12px 1rem;
+              border-top: 1px solid var(--border);
+            }
+
+            .title {
+              font-weight: bold;
+              margin-bottom: 0.5rem;
+            }
+
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              font-size: 0.9rem;
+            }
+
+            th {
+              text-align: right;
+              font-weight: normal;
+              color: var(--text-light);
+              padding: 0.2rem 0.4rem;
+              white-space: nowrap;
+            }
+
+            td {
+              text-align: right;
+              padding: 0.35rem 0.4rem;
+              font-variant-numeric: tabular-nums;
+            }
+
+            th:first-child,
+            td:first-child {
+              text-align: left;
+              padding-left: 0;
+            }
+
+            tbody tr + tr td {
+              border-top: 1px solid var(--border);
+            }
+          </style>
+          """)
+
+          p = ext / "popup/index.ts"
+          s = p.read_text()
+          s = replace_once(s, 'import PopupPage from "./PopupPage.svelte";',
+                           'import PopupPage from "./PopupPage.svelte";\nimport StatsView from "./StatsView.svelte";', "popup import")
+          s = replace_once(s, "exposeGlobals({", "new StatsView({ target: document.body });\n\nexposeGlobals({", "popup mount")
+          p.write_text(s)
+          print("stats patch OK")
+          PY
+
       - name: Pre-generate files that Xcode expects to already exist
         working-directory: src
         run: |
@@ -563,6 +1051,7 @@ jobs:
           echo "App: $APP"
           mkdir -p ipa/Payload
           cp -R "$APP" ipa/Payload/
+          rm -rf "ipa/Payload/$(basename "$APP")/PlugIns/Yomikiri Action.appex"
           PLIST="ipa/Payload/$(basename "$APP")/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Yomikiri-RU" "$PLIST" || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Yomikiri-RU" "$PLIST"
           /usr/libexec/PlistBuddy -c "Set :CFBundleName Yomikiri-RU" "$PLIST" || true
