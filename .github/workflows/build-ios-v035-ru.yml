@@ -244,6 +244,42 @@ jobs:
           print("audio patch OK")
           PY
 
+      - name: Patch CSS (dark theme by default)
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+
+          p = pathlib.Path("src/main/src/global.css")
+          s = p.read_text()
+
+          dark = {
+              "text": "#e8e8e8",
+              "text-light": "#a0a0a5",
+              "text-faint": "#6e6e73",
+              "text-success": "#5fd068",
+              "text-warn": "#ff6b6b",
+              "border": "#3a3a3c",
+              "background": "#1c1c1e",
+              "background-alt-light": "#242426",
+              "background-alt": "#2c2c2e",
+              "background-dark": "#48484a",
+              "input": "#2c2c2e",
+              "selected-blue": "#0a84ff",
+              "button-light": "#8e8e93",
+              "button-bg": "#3a3a3c",
+          }
+          for name, value in dark.items():
+              pattern = re.compile(r"^(  --" + re.escape(name) + r": )[^;]+;", re.M)
+              assert len(pattern.findall(s)) == 1, "css variable not found once: " + name
+              s = pattern.sub(lambda m: m.group(1) + value + ";", s)
+
+          old = "  --edge-horizontal-padding: 8px;"
+          assert s.count(old) == 1, "edge padding var not found"
+          s = s.replace(old, old + "\n  color-scheme: dark;")
+          p.write_text(s)
+          print("dark theme OK")
+          PY
+
       - name: Pre-generate files that Xcode expects to already exist
         working-directory: src
         run: |
