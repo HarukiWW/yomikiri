@@ -308,7 +308,7 @@ jobs:
           patch("groups/GroupAbout.svelte", [
               ('title="About"', 'title="О программе"'),
               ('title="About Yomikiri"', 'title="О Yomikiri"'),
-              ('return "v" + versionInfo.version;', 'return "1.0 beta(' + build + ')";'),
+              ('return "v" + versionInfo.version;', 'return "1.0 release (' + build + ')";'),
               ("Loading version.", "Загрузка версии."),
               ('title="Third party licenses"', 'title="Лицензии третьих сторон"'),
               ('buttonText={"View"}', 'buttonText={"Открыть"}'),
@@ -728,6 +728,19 @@ jobs:
               for (const k of word.match(KANJI) ?? []) {
                 if (!d.kanji.includes(k)) d.kanji.push(k);
               }
+            });
+          }
+
+          /** Removes a word from today's mined words and recounts today's kanji. */
+          export function removeMinedWord(word: string): Promise<void> {
+            return update((data) => {
+              const d = today(data);
+              d.mined = d.mined.filter((w) => w !== word);
+              const kanji = new Set<string>();
+              for (const w of d.mined) {
+                for (const k of w.match(KANJI) ?? []) kanji.add(k);
+              }
+              d.kanji = Array.from(kanji);
             });
           }
 
@@ -1210,6 +1223,8 @@ jobs:
               streak,
               lastDays,
               resetStats,
+              removeMinedWord,
+              localDate,
               STATS_KEY,
               type StatsData,
             } from "extension/stats";
@@ -1274,6 +1289,7 @@ jobs:
             $: days = lastDays(data, 7);
             $: maxRead = Math.max(1, ...days.map((d) => d.read));
             $: streakDays = streak(data);
+            $: todayWords = data.days[localDate()]?.mined ?? [];
           </script>
 
           <div class="stats">
@@ -1352,6 +1368,15 @@ jobs:
               {/each}
             </div>
             <div class="hint">Под днём: слов добавлено в Anki</div>
+
+            {#if todayWords.length > 0}
+              <div class="chart-title">Добавлено сегодня (нажмите на слово, чтобы убрать из счёта)</div>
+              <div class="words">
+                {#each todayWords as w}
+                  <button class="word" on:click={() => void removeMinedWord(w)}>{w}</button>
+                {/each}
+              </div>
+            {/if}
 
             <button class="reset" class:confirm={confirmReset} on:click={onReset}>
               {confirmReset ? "Нажмите ещё раз: удалить всё" : "Сбросить статистику"}
@@ -1457,6 +1482,21 @@ jobs:
               margin-top: 0.4em;
               color: var(--text-faint);
               font-size: 0.75em;
+            }
+
+            .words {
+              display: flex;
+              flex-wrap: wrap;
+              gap: 0.4em;
+              margin-top: 0.5em;
+            }
+
+            .word {
+              padding: 0.3em 0.7em;
+              border: 1px solid var(--border);
+              border-radius: 0.4em;
+              font-size: 0.9em;
+              text-align: center;
             }
 
             .reset {
