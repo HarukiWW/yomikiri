@@ -1,6 +1,6 @@
-name: Build iOS v0.3.5 (Russian dictionary)
+name: Build iOS v1.1 (Russian dictionary)
 
-# Builds the official v0.3.5 release code (same code as the App Store version)
+# Builds the official v1.1 release code (same code as the App Store version)
 # with the Russian dictionary and sideload-friendly fixes.
 
 on:
