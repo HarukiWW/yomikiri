@@ -2634,6 +2634,51 @@ jobs:
 
             .reset.confirm {''', "popup diag css")
           p.write_text(s)
+          # ---------- 6. share sheet: the link arrives as a JSON string (with quotes), decode it; stronger opening ----------
+          p = root / "Yomikiri Action/ActionViewController.swift"
+          s = p.read_text()
+          s = replace_once(s, """                    guard let urlString = request as? String else {
+                                  throw "'openLink' url is not string"
+                              }
+          """, """                    guard let rawString = request as? String else {
+                                  throw "'openLink' url is not string"
+                              }
+                              // the web part sends the link as a JSON string: "\\"anki://...\\""
+                              let urlString: String = (try? jsonDeserialize(json: rawString)) ?? rawString
+          """, "action decode json")
+          m = re.search(r"    func openURL\(_ url: URL\) \{.*?\n    \}\n", s, re.S)
+          assert m, "action openURL not found"
+          NEW_OPEN = r"""    func openURL(_ url: URL) {
+                  if let ctx = self.extensionContext {
+                      ctx.open(url, completionHandler: nil)
+                  }
+                  // A share extension cannot open another app by itself: ask an object that can (responder chain, then UIApplication).
+                  let selector = NSSelectorFromString("openURL:options:completionHandler:")
+                  typealias OpenFunction = @convention(c) (AnyObject, Selector, URL, [UIApplication.OpenExternalURLOptionsKey: Any], ((Bool) -> Void)?) -> Void
+                  var targets: [NSObject] = []
+                  var responder: UIResponder? = self
+                  while let current = responder {
+                      targets.append(current)
+                      responder = current.next
+                  }
+                  let sharedSelector = NSSelectorFromString("sharedApplication")
+                  if UIApplication.responds(to: sharedSelector),
+                     let app = UIApplication.perform(sharedSelector)?.takeUnretainedValue() as? NSObject
+                  {
+                      targets.append(app)
+                  }
+                  for target in targets {
+                      if target.responds(to: selector), let imp = target.method(for: selector) {
+                          let function = unsafeBitCast(imp, to: OpenFunction.self)
+                          function(target, selector, url, [:], nil)
+                          return
+                      }
+                  }
+              }
+          """
+          s = s[: m.start()] + NEW_OPEN + s[m.end():]
+          p.write_text(s)
+          print("share sheet patch OK")
           print("sync patch OK")
           PY
 
