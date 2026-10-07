@@ -1,6 +1,6 @@
-name: Build iOS v1.1 (Russian dictionary)
+name: Build iOS v0.3.5 (Russian dictionary)
 
-# Builds the official v1.1 release code (same code as the App Store version)
+# Builds the official v0.3.5 release code (same code as the App Store version)
 # with the Russian dictionary and sideload-friendly fixes.
 
 on:
@@ -730,7 +730,7 @@ jobs:
           patch("groups/GroupAbout.svelte", [
               ('title="About"', 'title="О программе"'),
               ('title="About Yomikiri"', 'title="О Yomikiri"'),
-              ('return "v" + versionInfo.version;', 'return "1.0 release (' + build + ')";'),
+              ('return "v" + versionInfo.version;', 'return "1.1 release (' + build + ')";'),
               ("Loading version.", "Загрузка версии."),
               ('title="Third party licenses"', 'title="Лицензии третьих сторон"'),
               ('buttonText={"View"}', 'buttonText={"Открыть"}'),
@@ -2945,6 +2945,98 @@ jobs:
           s = p.read_text()
           s = replace_once(s, "    border-radius: 8px;\n", "    border-radius: 14px;\n    overflow: hidden;\n", "card radius")
           p.write_text(s)
+          # ======================= version 1.1 everywhere =======================
+          p = pathlib.Path("src/package.json")
+          s = p.read_text()
+          s = replace_once(s, '"version": "0.3.5"', '"version": "1.1"', "package version")
+          p.write_text(s)
+
+          # ======================= look like the statistics screen =======================
+          p = root / "iOS (App)/OptionsView.swift"
+          s = p.read_text()
+          s = replace_once(s, '.navigationTitle("Настройки")\n            .navigationBarTitleDisplayMode(.inline)',
+                           '.navigationTitle("Настройки")\n            .navigationBarTitleDisplayMode(.large)', "large title")
+          s = replace_once(s, "        appearance.backgroundColor = UIColor(OptionsView.BACKGROUND_COLOR)\n",
+                           "        appearance.backgroundColor = UIColor(OptionsView.BACKGROUND_COLOR)\n        appearance.largeTitleTextAttributes = [.font: UIFont.systemFont(ofSize: 30, weight: .bold)]\n", "large title font")
+          p.write_text(s)
+
+          p = web / "components/options/GroupedOptions.svelte"
+          s = p.read_text()
+          s = replace_once(s, "    font-size: 1.6rem;\n", "    font-size: 0.95rem;\n    color: var(--text-light);\n    padding-left: 8px;\n", "group title")
+          p.write_text(s)
+          p = web / "components/options/items/OptionBase.svelte"
+          s = p.read_text()
+          s = replace_once(s, "    padding: 6px 0px;\n", "    padding: 12px 0px;\n", "option padding")
+          s = replace_once(s, "    margin: 0px 8px;\n", "    margin: 0px 14px;\n", "option margin")
+          p.write_text(s)
+
+          # Russian for the last visible English texts that are not technical
+          p = web / "components/dictionary/Tokenize.svelte"
+          s = p.read_text()
+          s = replace_once(s, 'placeholder="Enter Japanese word or sentence."', 'placeholder="Введите японское слово или предложение"', "search placeholder")
+          s = replace_once(s, 'label="Close"', 'label="Закрыть"', "close label")
+          p.write_text(s)
+          p = web / "iosapp/DictionaryView.svelte"
+          s = p.read_text()
+          s = replace_once(s, "Type in Japanese text", "Введите японский текст", "placeholder text")
+          s = replace_once(s, "    background-color: var(--background);\n    display: flex;\n    align-items: center;\n", "    background-color: #000000;\n    display: flex;\n    align-items: center;\n", "placeholder bg")
+          p.write_text(s)
+
+          # dictionary page of the app and the share sheet: black page, rounded search field, entries as cards
+          p = web / "iosapp/DictionaryPage.svelte"
+          s = p.read_text()
+          s = replace_once(s, "<style global>\n", """<style global>
+            html:root,
+            html body {
+              background-color: #000000 !important;
+            }
+
+            .search .header,
+            .search .tokensview,
+            .search .entries {
+              background-color: #000000 !important;
+            }
+
+            .search .header {
+              padding: 10px 12px 6px 12px !important;
+            }
+
+            .search .header.action-button-mode {
+              padding-bottom: 28px !important;
+              border-bottom: none !important;
+            }
+
+            .search .searchbar {
+              border: none !important;
+              border-radius: 14px !important;
+              background-color: #1c1c1e !important;
+              padding: 6px 10px !important;
+            }
+
+            .search .searchbar input {
+              background-color: transparent !important;
+            }
+
+            .search .tokensview {
+              margin: 6px 12px;
+              padding: 8px 10px !important;
+              border-radius: 14px;
+              background-color: #1c1c1e !important;
+            }
+
+            .search .entries > div > div {
+              margin: 10px 12px;
+              border: none !important;
+              border-radius: 14px;
+              background-color: #1c1c1e;
+            }
+
+            .search .entries > div {
+              padding-bottom: 12px;
+            }
+
+          """, "dictionary page css")
+          p.write_text(s)
           print("app patch OK")
           PY
 
@@ -2977,6 +3069,7 @@ jobs:
             -derivedDataPath build \
             -skipPackagePluginValidation -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            MARKETING_VERSION=1.1 CURRENT_PROJECT_VERSION=1.1 \
             build 2>&1 | tee xcodebuild.log
 
       - name: Package .ipa
@@ -2996,6 +3089,12 @@ jobs:
           PLIST="$APPDIR/Info.plist"
           /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Yomikiri-RU" "$PLIST" || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Yomikiri-RU" "$PLIST"
           /usr/libexec/PlistBuddy -c "Set :CFBundleName Yomikiri-RU" "$PLIST" || true
+          # version 1.1 in the app, the extensions and the frameworks
+          for P in "$PLIST" "$APPDIR"/PlugIns/*.appex/Info.plist "$APPDIR"/Frameworks/*.framework/Info.plist; do
+            [ -f "$P" ] || continue
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.1" "$P" || /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 1.1" "$P"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1.1" "$P" || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string 1.1" "$P"
+          done
           if [ "$EMBED_ENTITLEMENTS" != "false" ]; then
             # Put the App Group into the entitlements of the app and the extensions,
             # so the signing tool keeps it and they can share settings and statistics.
