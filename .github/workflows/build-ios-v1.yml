@@ -2658,12 +2658,16 @@ jobs:
                   var targets: [NSObject] = []
                   var responder: UIResponder? = self
                   while let current = responder {
-                      targets.append(current)
+                      // UIScene has a method with the same name but other options: only UIApplication is suitable
+                      if current is UIApplication {
+                          targets.append(current)
+                      }
                       responder = current.next
                   }
                   let sharedSelector = NSSelectorFromString("sharedApplication")
                   if UIApplication.responds(to: sharedSelector),
-                     let app = UIApplication.perform(sharedSelector)?.takeUnretainedValue() as? NSObject
+                     let app = UIApplication.perform(sharedSelector)?.takeUnretainedValue() as? NSObject,
+                     app is UIApplication
                   {
                       targets.append(app)
                   }
