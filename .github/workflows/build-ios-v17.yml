@@ -4448,26 +4448,24 @@ jobs:
           # ---------- 1. MainView: add Video tab ----------
           p = root / "iOS (App)/MainView.swift"
           s = p.read_text()
-          m = re.search(r"enum Tabs \{[^}]*\}", s)
-          if m and "case video" not in m.group(0):
-              block = m.group(0)
-              s = s.replace(block, block[:-1] + "    case video\n}")
-              report.append("enum Tabs: case video added")
-          elif m:
+          enum_line = "        case help, dictionary, settings\n"
+          if "case help, dictionary, settings, video" in s:
               report.append("enum Tabs: case video already present")
+          elif s.count(enum_line) == 1:
+              s = s.replace(enum_line, "        case help, dictionary, settings, video\n")
+              report.append("enum Tabs: case video added")
           else:
-              report.append("WARNING: enum Tabs not found; video tab NOT added")
-          if re.search(r"enum Tabs \{[^}]*case video[^}]*\}", s):
+              report.append("WARNING: enum Tabs line not found; video tab NOT added")
+          if "case help, dictionary, settings, video" in s:
               anchor = "                .tag(Tabs.settings)\n        }\n        .preferredColorScheme(.dark)"
-              if anchor in s:
+              if s.count(anchor) == 1:
                   replacement = (
                       "                .tag(Tabs.settings)\n"
-                      "\n"
-                      "        VideoTabView()\n"
-                      "            .tabItem {\n"
-                      '                Label("Видео", systemImage: "play.rectangle.fill")\n'
-                      "            }\n"
-                      "            .tag(Tabs.video)\n"
+                      "            VideoTabView()\n"
+                      "                .tabItem {\n"
+                      '                    Label("Видео", systemImage: "play.rectangle.fill")\n'
+                      "                }\n"
+                      "                .tag(Tabs.video)\n"
                       "        }\n"
                       "        .preferredColorScheme(.dark)"
                   )
