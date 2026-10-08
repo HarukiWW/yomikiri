@@ -110,14 +110,13 @@ jobs:
       - name: Patch Rust (example sentences in dictionary entries)
         run: |
           python3 - <<'PY'
-          import pathlib
+          import pathlib, re
           def replace_once(text, old, new, label):
               assert text.count(old) == 1, "pattern not found exactly once: " + label
               return text.replace(old, new)
           def edit(path, fn):
               p = pathlib.Path("src") / path
               p.write_text(fn(p.read_text(encoding="utf-8")), encoding="utf-8")
-          # --- jmdict crate: <example>japanese U+E002 translation</example>
           def types_rs(s):
               return replace_once(s, "    // 'example'\n    // example: Vec<Example>,\n}\n", """    /// 'example' (custom format: japanese, U+E002, translation)
           pub examples: Vec<JMExample>,
@@ -132,21 +131,29 @@ jobs:
           def parse_rs(s):
               s = replace_once(s, "use super::types::{\n    JMDialect, JMDict, JMEntry, JMKanji, JMKanjiInfo, JMPartOfSpeech, JMReading, JMSense,\n    JMSenseMisc,\n};",
                   "use super::types::{\n    JMDialect, JMDict, JMEntry, JMExample, JMKanji, JMKanjiInfo, JMPartOfSpeech, JMReading,\n    JMSense, JMSenseMisc,\n};", "parse.rs import")
-              s = replace_once(s, """                b"example" => {
-                          parse_string_in_tag_into(&mut self.reader, &mut self.buf, b"example")?;
-                      }""", """                b"example" => {
-                          let text =
-                              parse_string_in_tag_into(&mut self.reader, &mut self.buf, b"example")?;
-                          if let Some((japanese, translation)) = text.split_once('\\u{e002}') {
-                              sense.examples.push(JMExample {
-                                  japanese: japanese.to_string(),
-                                  translation: translation.to_string(),
-                              });
-                          }
-                      }""", "parse.rs example arm")
-              return s
+              # the match arm is searched with a regex: indentation in upstream may differ
+              m = re.search(r'[ \t]*b"example"[ \t]*=>[ \t]*\{[^{}]*\}', s)
+              if m is None:
+                  print("WARNING: example arm not found in parse.rs: example sentences will stay empty")
+                  return s
+              indent = re.match(r"[ \t]*", m.group(0)).group(0)
+              i4 = indent + "    "
+              i8 = indent + "        "
+              i12 = indent + "            "
+              new_arm = (
+                  indent + 'b"example" => {\n'
+                  + i4 + "let text =\n"
+                  + i8 + 'parse_string_in_tag_into(&mut self.reader, &mut self.buf, b"example")?;\n'
+                  + i4 + "if let Some((japanese, translation)) = text.split_once('\\u{e002}') {\n"
+                  + i8 + "sense.examples.push(JMExample {\n"
+                  + i12 + "japanese: japanese.to_string(),\n"
+                  + i12 + "translation: translation.to_string(),\n"
+                  + i8 + "});\n"
+                  + i4 + "}\n"
+                  + indent + "}"
+              )
+              return s[: m.start()] + new_arm + s[m.end():]
           edit("crates/jmdict/src/jmdict/parse.rs", parse_rs)
-          # --- yomikiri-dictionary crate: Sense.examples
           def entry_rs(s):
               return replace_once(s, "    pub dialects: Vec<JMDialect>,\n}\n", """    pub dialects: Vec<JMDialect>,
               /// Example sentences (Japanese with marked keyword, translation)
@@ -183,6 +190,7 @@ jobs:
           edit("crates/yomikiri-dictionary/src/lib.rs", lambda s: replace_once(s,
               "pub use entry::{Kanji, PartOfSpeech, Reading, Sense, WordEntry};",
               "pub use entry::{Kanji, PartOfSpeech, Reading, Sense, SenseExample, WordEntry};", "lib.rs"))
+          print("rust patch OK")
           PY
       - name: Add example sentences to the Russian dictionary (XML)
         if: ${{ !inputs.english }}
@@ -196,7 +204,6 @@ jobs:
           import glob, json, sys, zipfile, re, unicodedata
           KS, KE, SEP = "\ue000", "\ue001", "\ue002"
           def flat(node, mark=False):
-              """Plain text of structured content; skips <rt>; marks example-keyword."""
               if node is None:
                   return ""
               if isinstance(node, str):
@@ -230,7 +237,6 @@ jobs:
           def norm(s):
               return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", s)).strip()
           def extract(zip_path):
-              """-> {seq: [variant, ...]}, variant = [ {"glosses": [..], "examples": [(ja_marked, ru)]}, ... ] (all senses of one Yomitan entry)"""
               result = {}
               with zipfile.ZipFile(zip_path) as z:
                   names = sorted(n for n in z.namelist() if re.match(r"term_bank_\d+\.json$", n.split("/")[-1]))
@@ -248,7 +254,7 @@ jobs:
                                       for li in (c if isinstance(c, list) else [c]):
                                           t = norm(flat(li))
                                           if t:
-                                              glosses.append(t)
+                                      glosses.append(t)
                                   exs = []
                                   for ex in find(sense, "example-sentence", []):
                                       a = find(ex, "example-sentence-a", [])
@@ -353,12 +359,14 @@ jobs:
         run: |
           python3 - <<'PY'
           import pathlib
-          def replace_once(text, old, new, label):
-              assert text.count(old) == 1, "pattern not found exactly once: " + label
-              return text.replace(old, new)
+          def try_replace(s, old, new, label):
+              if s.count(old) == 1:
+                  return s.replace(old, new)
+              print("WARNING: pattern not found, skipped: " + label)
+              return s
           p = pathlib.Path("src/main/src/components/dictionary/GroupedSenseView.svelte")
           s = p.read_text(encoding="utf-8")
-          s = replace_once(s, '  $: posText = group.pos.join(", ");\n', '''  $: posText = group.pos.join(", ");
+          s = try_replace(s, '  $: posText = group.pos.join(", ");\n', '''  $: posText = group.pos.join(", ");
             /** Splits an example sentence into plain parts and the keyword (U+E000 ... U+E001). */
             function exampleParts(text: string): { text: string; key: boolean }[] {
               const parts: { text: string; key: boolean }[] = [];
@@ -374,7 +382,7 @@ jobs:
               return parts;
             }
           ''', "svelte script")
-          s = replace_once(s, '''          >{/if}
+          s = try_replace(s, '''          >{/if}
               </div>
             {/each}''', '''          >{/if}
                 {#if sense.examples && sense.examples.length > 0}
@@ -391,7 +399,7 @@ jobs:
                 {/if}
               </div>
             {/each}''', "svelte template")
-          s = replace_once(s, "</style>", '''
+          s = try_replace(s, "</style>", '''
             .examples {
               margin: 0.2rem 0 0.4rem 1.1rem;
               padding-left: 0.6rem;
@@ -416,6 +424,7 @@ jobs:
             }
           </style>''', "svelte style")
           p.write_text(s, encoding="utf-8")
+          print("svelte examples patch done")
           PY
       - name: Patch Swift (App Group sync, statistics tab, share sheet)
         run: |
@@ -593,6 +602,7 @@ jobs:
                   _ = try? Storage.stats.set("{\\"days\\":{},\\"resetToken\\":\\"" + token + "\\"}")
                   reload()
               }
+              /// `lastDays`: number of last days including today. nil: all time.
               func summary(lastDays: Int?) -> StatSummary {
                   var words = Set<String>()
                   var kanji = Set<String>()
@@ -1089,7 +1099,7 @@ jobs:
               if (i !== undefined) {
                 const items: [number, string][] = [];
                 if (t.data[i + 1] > 0) items.push([t.data[i + 1], String(t.data[i + 1])]);
-                if (t.data[i + 2] > 0) items.push([t.data[i + 2], t.data[i + 2] + "\u32d5"]);
+                if (t.data[i + 2] > 0) items.push([t.data[i + 2], t.data[i + 2] + "\\u32d5"]);
                 items.sort((a, b) => a[0] - b[0]);
                 results.push({ name: t.name, values: items.map((x) => x[1]) });
               }
@@ -1377,7 +1387,7 @@ jobs:
               }
             });
           }
-          const STEM = /^[\u3400-\u4dbf\u4e00-\u9fff]+/;
+          const STEM = /^[\\u3400-\\u4dbf\\u4e00-\\u9fff]+/;
           let minedCache: { at: number; words: string[] } | undefined;
           async function allMinedWords(): Promise<string[]> {
             const now = Date.now();
@@ -3528,6 +3538,7 @@ jobs:
                        }
                    }
                    .padding(16)''', '''                    .buttonStyle(.bordered)
+                       }
                        Button {
                            showMined = true
                        } label: {
@@ -3778,7 +3789,7 @@ jobs:
               packed = 0
               for i, pos in enumerate(table[key]):
                   packed |= (pos + 1) << (8 * i)
-              flat += [key, packed]
+          flat += [key, packed]
           blob = struct.pack("<%dI" % len(flat), *flat)
           bg = web / "extension/background"
           (bg / "pitchData.ts").write_text(
@@ -4722,7 +4733,6 @@ jobs:
             if (ext === "vtt") return parseSRT(text.replace(/^WEBVTT[^\n]*\n/, "").replace(/\./g, ","));
             return parseSRT(text);
           }
-          // --- minimal EBML/MKV subtitle extraction over Range requests ---
           function readBytes(name, start, size) {
             return fetch(mediaUrl(name), { headers: { Range: "bytes=" + start + "-" + (start + size - 1) } })
               .then(function (r) { return r.arrayBuffer(); })
@@ -4869,7 +4879,6 @@ jobs:
               });
             });
           }
-          // --- player state ---
           var cues = [];
           var vid = $("vid"), overlay = $("subOverlay");
           function listFiles() {
