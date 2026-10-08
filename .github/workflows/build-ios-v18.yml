@@ -95,6 +95,7 @@ jobs:
         working-directory: src
         run: pnpm run --dir ./crates/yomikiri-dictionary-generator download
       - name: Generate the original English dictionary (the app can switch to it)
+        working-directory: src
         run: |
           set -euo pipefail
           pnpm run --dir ./crates/yomikiri-dictionary-generator generate
