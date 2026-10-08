@@ -254,7 +254,7 @@ jobs:
                                       for li in (c if isinstance(c, list) else [c]):
                                           t = norm(flat(li))
                                           if t:
-                                      glosses.append(t)
+                                              glosses.append(t)
                                   exs = []
                                   for ex in find(sense, "example-sentence", []):
                                       a = find(ex, "example-sentence-a", [])
@@ -359,18 +359,18 @@ jobs:
         run: |
           python3 - <<'PY'
           import pathlib
-          def try_replace(s, old, new, label):
-              if s.count(old) == 1:
-                  return s.replace(old, new)
-              print("WARNING: pattern not found, skipped: " + label)
-              return s
           p = pathlib.Path("src/main/src/components/dictionary/GroupedSenseView.svelte")
           s = p.read_text(encoding="utf-8")
-          s = try_replace(s, '  $: posText = group.pos.join(", ");\n', '''  $: posText = group.pos.join(", ");
+
+          def replace_once(text, old, new, label):
+              assert text.count(old) == 1, "svelte examples: pattern not found exactly once: " + label
+              return text.replace(old, new)
+
+          s = replace_once(s, '  $: posText = group.pos.join(", ");\n', r'''  $: posText = group.pos.join(", ");
             /** Splits an example sentence into plain parts and the keyword (U+E000 ... U+E001). */
             function exampleParts(text: string): { text: string; key: boolean }[] {
               const parts: { text: string; key: boolean }[] = [];
-              const re = /\\ue000(.*?)\\ue001/g;
+              const re = /\ue000(.*?)\ue001/g;
               let last = 0;
               let m: RegExpExecArray | null;
               while ((m = re.exec(text)) !== null) {
@@ -381,10 +381,11 @@ jobs:
               if (last < text.length) parts.push({ text: text.slice(last), key: false });
               return parts;
             }
-          ''', "svelte script")
-          s = try_replace(s, '''          >{/if}
-              </div>
-            {/each}''', '''          >{/if}
+          ''', "script")
+
+          s = replace_once(s, '''          >{/if}
+                </div>
+              {/each}''', r'''          >{/if}
                 {#if sense.examples && sense.examples.length > 0}
                   <div class="examples">
                     {#each sense.examples as example}
@@ -397,9 +398,10 @@ jobs:
                     {/each}
                   </div>
                 {/if}
-              </div>
-            {/each}''', "svelte template")
-          s = try_replace(s, "</style>", '''
+                </div>
+              {/each}''', "template")
+
+          s = replace_once(s, "</style>", r'''
             .examples {
               margin: 0.2rem 0 0.4rem 1.1rem;
               padding-left: 0.6rem;
@@ -422,9 +424,9 @@ jobs:
               line-height: 1.3;
               color: var(--text-faint);
             }
-          </style>''', "svelte style")
+          </style>''', "style")
           p.write_text(s, encoding="utf-8")
-          print("svelte examples patch done")
+          print("svelte examples OK")
           PY
       - name: Patch Swift (App Group sync, statistics tab, share sheet)
         run: |
@@ -800,15 +802,11 @@ jobs:
           p.write_text(s)
           p = root / "Shared (iOS)/YomikiriWebView.swift"
           s = p.read_text()
-          s = replace_once(s, '''                guard let url = URL(string: urlString) else {
-                      throw "'openLink' url is not valid: \\(urlString)"''', '''                guard let url = makeUrl(urlString) else {
-                      throw "'openLink' url is not valid: \\(urlString)"''', "webview openLink")
+          s = replace_once(s, 'guard let url = URL(string: urlString) else {', 'guard let url = makeUrl(urlString) else {', "webview openLink")
           p.write_text(s)
           p = root / "Yomikiri Action/ActionViewController.swift"
           s = p.read_text()
-          s = replace_once(s, '''                    guard let url = URL(string: urlString) else {
-                              throw "'openLink' url is not valid: \\(urlString)"''', '''                    guard let url = makeUrl(urlString) else {
-                              throw "'openLink' url is not valid: \\(urlString)"''', "action openLink")
+          s = replace_once(s, 'guard let url = URL(string: urlString) else {', 'guard let url = makeUrl(urlString) else {', "action openLink")
           s = regex_replace_once(s, r"    func openURL\(_ url: URL\) \{.*?\n    \}\n", '''    func openURL(_ url: URL) {
               if let ctx = self.extensionContext {
                   ctx.open(url, completionHandler: nil)
@@ -2523,9 +2521,8 @@ jobs:
           s = replace_once(s, "    @State private var confirmReset = false\n",
                            "    @State private var confirmReset = false\n    @State private var diag = \"\"\n", "diag state")
           s = replace_once(s, '''                .buttonStyle(.bordered)
-                     }
-                 }
-                 .padding(16)''', '''                .buttonStyle(.bordered)
+                      }
+                      .padding(16)''', '''                .buttonStyle(.bordered)
                      Button {
                          diag = sharedStorageReport()
                      } label: {
@@ -2610,13 +2607,13 @@ jobs:
           p = root / "Yomikiri Action/ActionViewController.swift"
           s = p.read_text()
           s = replace_once(s, """                    guard let urlString = request as? String else {
-                              throw "'openLink' url is not string"
-                          }
+                                  throw "'openLink' url is not string"
+                              }
           """, """                    guard let rawString = request as? String else {
-                              throw "'openLink' url is not string"
-                          }
-                          // the web part sends the link as a JSON string: "\\"anki://...\\""
-                          let urlString: String = (try? jsonDeserialize(json: rawString)) ?? rawString
+                                  throw "'openLink' url is not string"
+                              }
+                              // web part sends the link as a JSON-encoded string
+                              let urlString: String = (try? jsonDeserialize(json: rawString)) ?? rawString
           """, "action decode json")
           m = re.search(r"    func openURL\(_ url: URL\) \{.*?\n    \}\n", s, re.S)
           assert m, "action openURL not found"
@@ -2691,11 +2688,11 @@ jobs:
           p = root / "iOS (App)/YomikiriApp.swift"
           s = p.read_text()
           s = replace_once(s, '''            tabBarAppearance.configureWithDefaultBackground()
-                  UITabBar.appearance().scrollEdgeAppearance = tabBarAppearance
+                      UITabBar.appearance().scrollEdgeAppearance = tabBarAppearance
           ''', '''            tabBarAppearance.configureWithOpaqueBackground()
-                  tabBarAppearance.backgroundColor = UIColor(red: 0.07, green: 0.07, blue: 0.075, alpha: 1)
-                  UITabBar.appearance().standardAppearance = tabBarAppearance
-                  UITabBar.appearance().scrollEdgeAppearance = tabBarAppearance
+                      tabBarAppearance.backgroundColor = UIColor(red: 0.07, green: 0.07, blue: 0.075, alpha: 1)
+                      UITabBar.appearance().standardAppearance = tabBarAppearance
+                      UITabBar.appearance().scrollEdgeAppearance = tabBarAppearance
           ''', "tab bar")
           p.write_text(s)
           bg = web / "extension/background"
@@ -3534,11 +3531,9 @@ jobs:
           p = root / "iOS (App)/HelpView.swift"
           s = p.read_text()
           s = replace_once(s, '    @State private var diag = ""\n', '    @State private var diag = ""\n    @State private var showMined = false\n', "mined state")
-          s = replace_once(s, '''                    .buttonStyle(.bordered)
-                       }
-                   }
-                   .padding(16)''', '''                    .buttonStyle(.bordered)
-                       }
+          s = replace_once(s, '''           }
+                 }
+                 .padding(16)''', '''           }
                        Button {
                            showMined = true
                        } label: {
@@ -3557,8 +3552,8 @@ jobs:
                            .cornerRadius(14)
                        }
                        .buttonStyle(.plain)
-                   }
-                   .padding(16)''', "mined row")
+                 }
+                 .padding(16)''', "mined row")
           s = replace_once(s, "        .onAppear {\n            sharedStorageHeartbeat()\n",
                            "        .sheet(isPresented: $showMined, onDismiss: { model.reload() }) {\n            MinedWordsView(model: model)\n        }\n        .onAppear {\n            sharedStorageHeartbeat()\n", "mined sheet")
           s = s.rstrip("\n") + "\n" + MINED_SWIFT
@@ -3789,7 +3784,7 @@ jobs:
               packed = 0
               for i, pos in enumerate(table[key]):
                   packed |= (pos + 1) << (8 * i)
-          flat += [key, packed]
+              flat += [key, packed]
           blob = struct.pack("<%dI" % len(flat), *flat)
           bg = web / "extension/background"
           (bg / "pitchData.ts").write_text(
@@ -4261,7 +4256,7 @@ jobs:
             if (!freqOn && jlptLevels.size === 0) return;
             const dict = String(config.get("highlight.dict"));
           '''),
-              ('  if (!installStyle(color)) return;\n\n  const highlight = new HighlightClass();\n  css.highlights.set(HL_NAME, highlight);\n',
+              ('  if (!installStyle(color)) return;\n  const highlight = new HighlightClass();\n  css.highlights.set(HL_NAME, highlight);\n',
                '''  let styles = "::highlight(" + HL_NAME + ") { color: " + color + "; }";
             for (const n of jlptLevels) {
               styles += " ::highlight(yomikiri-jlpt-" + n + ") { color: " + JLPT_COLORS[n] + "; }";
@@ -4306,12 +4301,12 @@ jobs:
               ('      await fillRanks(found.map((f) => f.item));\n',
                '      if (freqOn) await fillRanks(found.map((f) => f.item));\n      if (jlptLevels.size > 0) await fillJlpt(found.map((f) => f.item));\n'),
               ('''        const rank = rankCache.get(f.item.t + "|" + f.item.r + "|" + (f.item.k ? "1" : "0")) ?? 0;
-                if (rank < lo || rank > hi) continue;
-                if (mined.has(f.base) || mined.has(f.surface)) continue;
-                const range = makeRange(block.parts, f.begin, f.end);
-                if (range === null) continue;
-                highlight.add(range);
-                marks.push({ range, words: [f.base, f.surface] });
+                  if (rank < lo || rank > hi) continue;
+                  if (mined.has(f.base) || mined.has(f.surface)) continue;
+                  const range = makeRange(block.parts, f.begin, f.end);
+                  if (range === null) continue;
+                  highlight.add(range);
+                  marks.push({ range, words: [f.base, f.surface] });
           ''',
                '''        if (mined.has(f.base) || mined.has(f.surface)) continue;
                 let target: Painter | undefined;
