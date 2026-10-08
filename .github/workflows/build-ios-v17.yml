@@ -5028,6 +5028,179 @@ jobs:
           report.append("HelpView: video player code appended")
           print("\n".join(report))
           PY
+      - name: Add KSPlayer (SPM) and native MKV/MP4 player
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+
+          # ---------- 1. Xcode project: add KSPlayer (SPM, exact 2.3.4) to target "Yomikiri (iOS)" ----------
+          pb = pathlib.Path("src/safari/Yomikiri.xcodeproj/project.pbxproj")
+          s = pb.read_text(encoding="utf-8")
+          if "XCRemoteSwiftPackageReference" in s and "KSPlayer" in s:
+              report = "pbxproj: KSPlayer already present"
+          else:
+              PKG = "C6A1B2C3D4E5F60718293A01"
+              PROD = "C6A1B2C3D4E5F60718293A02"
+              BF = "C6A1B2C3D4E5F60718293A03"
+              for uid in (PKG, PROD, BF):
+                  assert s.count(uid) == 0, "id collision: " + uid
+
+              def once(text, old, new, label):
+                  n = text.count(old)
+                  assert n == 1, "pbxproj: %s found %d times" % (label, n)
+                  return text.replace(old, new)
+
+              s = once(s, "/* Begin PBXBuildFile section */\n",
+                       "/* Begin PBXBuildFile section */\n"
+                       "\t\t%s /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = %s /* KSPlayer */; };\n" % (BF, PROD),
+                       "PBXBuildFile begin")
+              s = once(s,
+                       "\t\t\t\t697EFFAB2BA2A9E00035360C /* YomikiriTokenizer.framework in Frameworks */,\n",
+                       "\t\t\t\t697EFFAB2BA2A9E00035360C /* YomikiriTokenizer.framework in Frameworks */,\n"
+                       "\t\t\t\t%s /* KSPlayer in Frameworks */,\n" % BF,
+                       "iOS frameworks phase")
+              s = once(s,
+                       '\t\t\tname = "Yomikiri (iOS)";\n\t\t\tproductName = "Yomikiri (iOS)";\n',
+                       '\t\t\tpackageProductDependencies = (\n\t\t\t\t%s /* KSPlayer */,\n\t\t\t);\n'
+                       '\t\t\tname = "Yomikiri (iOS)";\n\t\t\tproductName = "Yomikiri (iOS)";\n' % PROD,
+                       "iOS native target")
+              s = once(s, "\t\t\tisa = PBXProject;\n",
+                       "\t\t\tisa = PBXProject;\n\t\t\tpackageReferences = (\n\t\t\t\t%s /* XCRemoteSwiftPackageReference \"KSPlayer\" */,\n\t\t\t);\n" % PKG,
+                       "PBXProject")
+              sections = (
+                  "/* Begin XCRemoteSwiftPackageReference section */\n"
+                  "\t\t%s /* XCRemoteSwiftPackageReference \"KSPlayer\" */ = {\n"
+                  "\t\t\tisa = XCRemoteSwiftPackageReference;\n"
+                  "\t\t\trepositoryURL = \"https://github.com/kingslay/KSPlayer.git\";\n"
+                  "\t\t\trequirement = {\n"
+                  "\t\t\t\tkind = exactVersion;\n"
+                  "\t\t\t\tversion = 2.3.4;\n"
+                  "\t\t\t};\n"
+                  "\t\t};\n"
+                  "/* End XCRemoteSwiftPackageReference section */\n\n"
+                  "/* Begin XCSwiftPackageProductDependency section */\n"
+                  "\t\t%s /* KSPlayer */ = {\n"
+                  "\t\t\tisa = XCSwiftPackageProductDependency;\n"
+                  "\t\t\tpackage = %s /* XCRemoteSwiftPackageReference \"KSPlayer\" */;\n"
+                  "\t\t\tproductName = KSPlayer;\n"
+                  "\t\t};\n"
+                  "/* End XCSwiftPackageProductDependency section */\n\n"
+              ) % (PKG, PROD, PKG)
+              s = once(s, "/* Begin XCBuildConfiguration section */\n",
+                       sections + "/* Begin XCBuildConfiguration section */\n", "XCBuildConfiguration begin")
+              pb.write_text(s, encoding="utf-8")
+              report = "pbxproj: KSPlayer 2.3.4 added to Yomikiri (iOS)"
+          print(report)
+
+          # ---------- 2. Swift: import KSPlayer, native player, video tab switch ----------
+          hv = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          h = hv.read_text(encoding="utf-8")
+          if "NativeVideoEngine" in h:
+              print("swift: native player already present")
+          else:
+              m = re.search(r"^import SwiftUI\n", h, re.M)
+              assert m, "HelpView.swift: 'import SwiftUI' not found"
+              if "import KSPlayer" not in h:
+                  h = h[: m.end()] + "import KSPlayer\n" + h[m.end():]
+
+              old_tab = (
+                  "struct VideoTabView: View {\n"
+                  "    var body: some View {\n"
+                  "        PlayerWebView()\n"
+                  "            .ignoresSafeArea(edges: .bottom)\n"
+                  "    }\n"
+                  "}\n"
+              )
+              assert h.count(old_tab) == 1, "HelpView.swift: VideoTabView block not found exactly once"
+              new_tab = r'''struct VideoTabView: View {
+              @State private var useNative = false
+
+              var body: some View {
+                  VStack(spacing: 0) {
+                      Picker("Плеер", selection: $useNative) {
+                          Text("Со словарём").tag(false)
+                          Text("MKV и MP4").tag(true)
+                      }
+                      .pickerStyle(.segmented)
+                      .padding(8)
+                      if useNative {
+                          if #available(iOS 16.0, *) {
+                              NavigationView {
+                                  NativeVideoListView()
+                              }
+                              .navigationViewStyle(.stack)
+                          } else {
+                              Text("Нативный плеер нужен iOS 16 или новее.")
+                                  .foregroundColor(.secondary)
+                                  .padding()
+                              Spacer()
+                          }
+                      } else {
+                          PlayerWebView()
+                              .ignoresSafeArea(edges: .bottom)
+                      }
+                  }
+              }
+          }
+
+          // MARK: - Native player (KSPlayer): MKV and MP4 from the app's Videos folder
+
+          enum NativeVideoEngine {
+              /// AVPlayer cannot play MKV, so MKV goes to KSPlayer's FFmpeg engine (KSMEPlayer).
+              /// MP4/MOV use the system AVPlayer (hardware decoding, Picture in Picture).
+              static func prepare(for url: URL) {
+                  switch url.pathExtension.lowercased() {
+                  case "mkv", "webm":
+                      KSOptions.firstPlayerType = KSMEPlayer.self
+                  default:
+                      KSOptions.firstPlayerType = KSAVPlayer.self
+                  }
+              }
+
+              static func fileURL(_ name: String) -> URL {
+                  let dir = YomikiriMediaSchemeHandler.videosDirectory() ?? FileManager.default.temporaryDirectory
+                  return dir.appendingPathComponent(name)
+              }
+          }
+
+          @available(iOS 16.0, *)
+          struct NativeVideoPlayerScreen: View {
+              let url: URL
+
+              var body: some View {
+                  // The engine must be chosen before KSPlayer creates its player layer,
+                  // so it is set here, when this screen is actually shown.
+                  let _ = NativeVideoEngine.prepare(for: url)
+                  KSVideoPlayerView(url: url, options: KSOptions(), title: url.lastPathComponent)
+                      .ignoresSafeArea()
+              }
+          }
+
+          @available(iOS 16.0, *)
+          struct NativeVideoListView: View {
+              @State private var files: [String] = []
+
+              var body: some View {
+                  List {
+                      if files.isEmpty {
+                          Text("Нет файлов. Импортируйте MKV или MP4 через «Файлы» → Поделиться → Yomikiri.")
+                              .foregroundColor(.secondary)
+                      }
+                      ForEach(files, id: \.self) { name in
+                          NavigationLink(destination: NativeVideoPlayerScreen(url: NativeVideoEngine.fileURL(name))) {
+                              Text(name).lineLimit(2)
+                          }
+                      }
+                  }
+                  .navigationTitle("Видео")
+                  .onAppear { files = YomikiriVideoLibrary.fileNames() }
+              }
+          }
+          '''
+              h = h.replace(old_tab, new_tab, 1)
+              hv.write_text(h, encoding="utf-8")
+              print("swift: native player added")
+          PY
       - name: Pre-generate files that Xcode expects to already exist
         working-directory: src
         run: |
