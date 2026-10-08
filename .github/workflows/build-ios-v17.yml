@@ -2615,7 +2615,7 @@ jobs:
                               // web part sends the link as a JSON-encoded string
                               let urlString: String = (try? jsonDeserialize(json: rawString)) ?? rawString
           """, "action decode json")
-          m = re.search(r"    func openURL\(_ url: URL\) \{.*?\n    \}\n", s, re.S)
+          m = re.search(r"    func openURL\(_ url: URL\) \{.*?\n\}\n", s, re.S)
           assert m, "action openURL not found"
           NEW_OPEN = r"""    func openURL(_ url: URL) {
               if let ctx = self.extensionContext {
