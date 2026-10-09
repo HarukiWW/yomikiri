@@ -5119,7 +5119,7 @@ jobs:
               m = re.search(r"^import SwiftUI\n", h, re.M)
               assert m, "HelpView.swift: 'import SwiftUI' not found"
               if "import KSPlayer" not in h:
-                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\nimport UniformTypeIdentifiers\n" + h[m.end():]
+                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\nimport UniformTypeIdentifiers\nimport UIKit\nimport Vision\n" + h[m.end():]
 
               # 3a. video folder: Documents/Videos (visible in Files), migrate old App Group files once
               old_dir = (
@@ -5520,6 +5520,7 @@ jobs:
               @State private var refKeys = Set<Int>()
               @State private var syncMessage = ""
               @State private var videoSize = CGSize.zero
+              @State private var lastOCRKey = -1
 
               private var delayKey: String { "subdelay." + url.lastPathComponent }
 
@@ -5596,12 +5597,27 @@ jobs:
                       }
                   }
                   .onReceive(coordinator.subtitleModel.$parts) { parts in
-                      subtitleLine = parts.compactMap { $0.text?.string }
-                          .joined(separator: " ")
-                          .trimmingCharacters(in: .whitespacesAndNewlines)
                       textParts = parts.filter { $0.text != nil }.count
                       imageParts = parts.filter { $0.image != nil }.count
                       trackName = coordinator.subtitleModel.selectedSubtitleInfo?.name ?? "выключены"
+                      let text = parts.compactMap { $0.text?.string }
+                          .joined(separator: " ")
+                          .trimmingCharacters(in: .whitespacesAndNewlines)
+                      if !text.isEmpty {
+                          subtitleLine = text
+                      } else if let part = parts.first(where: { $0.image != nil }), let image = part.image {
+                          let key = Int((part.start * 100).rounded())
+                          if key != lastOCRKey {
+                              lastOCRKey = key
+                              SubtitleOCR.recognize(image) { recognized in
+                                  DispatchQueue.main.async {
+                                      if key == lastOCRKey { subtitleLine = recognized }
+                                  }
+                              }
+                          }
+                      } else {
+                          subtitleLine = ""
+                      }
                       collectReference(parts)
                   }
                   .onAppear {
@@ -5617,14 +5633,13 @@ jobs:
                       await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator,
                                                                  pickSubtitle: NativeVideoEngine.sidecarSubtitle(for: url) == nil)
                   }
-                  .fileImporter(isPresented: $showImporter, allowedContentTypes: [.item],
-                                allowsMultipleSelection: false) { result in
-                      switch result {
-                      case .success(let urls):
-                          if let src = urls.first { addExternalSubtitle(src) }
-                      case .failure(let error):
-                          syncMessage = "Выбор файла не удался: \(error.localizedDescription)"
-                      }
+                  .sheet(isPresented: $showImporter) {
+                      DocumentPicker(onPick: { url in
+                          showImporter = false
+                          addExternalSubtitle(url)
+                      }, onCancel: {
+                          showImporter = false
+                      })
                   }
                   .onChange(of: showLookup) { isShown in
                       if !isShown {
@@ -5759,6 +5774,69 @@ jobs:
                   lookupEntries = result.entries
                   coordinator.playerLayer?.pause()
                   showLookup = true
+              }
+          }
+
+          /// Bitmap subtitles have no text: Japanese text is read from the picture with Vision.
+          enum SubtitleOCR {
+              static func recognize(_ image: UIImage, completion: @escaping (String) -> Void) {
+                  let size = image.size
+                  let format = UIGraphicsImageRendererFormat.default()
+                  format.scale = 1
+                  // transparent areas confuse OCR: draw the subtitle on black first
+                  let flat = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+                      UIColor.black.setFill()
+                      ctx.fill(CGRect(origin: .zero, size: size))
+                      image.draw(in: CGRect(origin: .zero, size: size))
+                  }
+                  guard let cg = flat.cgImage else {
+                      completion("")
+                      return
+                  }
+                  let request = VNRecognizeTextRequest { request, _ in
+                      let observations = request.results as? [VNRecognizedTextObservation] ?? []
+                      completion(observations.compactMap { $0.topCandidates(1).first?.string }.joined())
+                  }
+                  request.recognitionLanguages = ["ja-JP"]
+                  request.recognitionLevel = .accurate
+                  request.usesLanguageCorrection = false
+                  DispatchQueue.global(qos: .userInitiated).async {
+                      try? VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])
+                  }
+              }
+          }
+
+          /// System file picker. asCopy: the chosen file is copied, no security-scoped access is needed.
+          struct DocumentPicker: UIViewControllerRepresentable {
+              let onPick: (URL) -> Void
+              let onCancel: () -> Void
+
+              func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick, onCancel: onCancel) }
+
+              func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+                  let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+                  picker.delegate = context.coordinator
+                  return picker
+              }
+
+              func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+              final class Coordinator: NSObject, UIDocumentPickerDelegate {
+                  let onPick: (URL) -> Void
+                  let onCancel: () -> Void
+
+                  init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
+                      self.onPick = onPick
+                      self.onCancel = onCancel
+                  }
+
+                  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+                      if let url = urls.first { onPick(url) }
+                  }
+
+                  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+                      onCancel()
+                  }
               }
           }
 
@@ -7387,6 +7465,12 @@ jobs:
           assert s.count(old) == 1, "KSPlayer title view changed: update the patch"
           f.write_text(s.replace(old, '            Text("")\n'), encoding="utf-8")
           print("KSPlayer: built-in title hidden (the app draws its own title)")
+          f2 = pathlib.Path("spm/checkouts/KSPlayer/Sources/KSPlayer/SwiftUI/KSVideoPlayerView.swift")
+          s2 = f2.read_text(encoding="utf-8")
+          old2 = '            if let image {\n                Spacer()\n                GeometryReader { geometry in'
+          assert s2.count(old2) == 1, "KSPlayer subtitle image view changed: update the patch"
+          f2.write_text(s2.replace(old2, '            if let image, false {\n                Spacer()\n                GeometryReader { geometry in'), encoding="utf-8")
+          print("KSPlayer: bitmap subtitles are not drawn (the app reads them itself)")
           PY
           xcodebuild \
             -project "$PROJ" \
