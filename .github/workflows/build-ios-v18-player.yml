@@ -6023,6 +6023,12 @@ jobs:
               }
           }
 
+          /// A bitmap subtitle object (PGS/VobSub) with its position on the subtitle canvas.
+          struct PicturePart {
+              let image: UIImage
+              let origin: CGPoint
+          }
+
           struct LookupToken: Identifiable {
               let id: Int
               let text: String
@@ -6282,6 +6288,7 @@ jobs:
               @State private var line = ""                  // the line shown and searched
               @State private var kpSubtitle = ""            // text or OCR result from KSPlayer's track
               @State private var lastOCRKey = -1
+              @State private var pictures: [PicturePart] = []
               @State private var embeddedCues: [EmbeddedSubtitles.Cue] = []
               @State private var externalCues: [EmbeddedSubtitles.Cue] = []
               @State private var externalURLs: [URL] = []   // added subtitle files, shown in the track list
@@ -6306,23 +6313,27 @@ jobs:
               var body: some View {
                   // the engine must be chosen before the player layer is created
                   let _ = NativeVideoEngine.prepare(for: url)
-                  GeometryReader { geo in
-                      let rect = NativeVideoEngine.fitRect(in: geo.size, content: videoSize)
-                      ZStack {
-                          KSVideoPlayer(coordinator: coordinator, url: url, options: options)
-                              .frame(width: geo.size.width, height: geo.size.height)
-                          // a tap on the picture shows or hides the controls
-                          Color.black.opacity(0.001)
-                              .contentShape(Rectangle())
-                              .onTapGesture { toggleControls() }
-                          subtitleLayer(rect)
-                          if controlsVisible {
-                              controlsLayer(geo)
+                  ZStack {
+                      GeometryReader { geo in
+                          let rect = NativeVideoEngine.fitRect(in: geo.size, content: videoSize)
+                          ZStack {
+                              KSVideoPlayer(coordinator: coordinator, url: url, options: options)
+                                  .frame(width: geo.size.width, height: geo.size.height)
+                              // a tap on the picture shows or hides the controls
+                              Color.black.opacity(0.001)
+                                  .contentShape(Rectangle())
+                                  .onTapGesture { toggleControls() }
+                              pictureLayer(rect)
+                              subtitleLayer(rect)
                           }
+                          .frame(width: geo.size.width, height: geo.size.height)
                       }
-                      .frame(width: geo.size.width, height: geo.size.height)
+                      .ignoresSafeArea()
+                      // controls are inside the safe area: never under the status bar or the home indicator
+                      if controlsVisible {
+                          controlsLayer
+                      }
                   }
-                  .ignoresSafeArea()
                   .toolbar(.hidden, for: .tabBar)
                   .navigationBarHidden(true)
                   .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
@@ -6352,6 +6363,25 @@ jobs:
 
               // MARK: - layers
 
+              /// Bitmap subtitles are drawn like PGS renderers do: the subtitle canvas (the video size) is mapped onto
+              /// the video rectangle, and each object is placed at its own position on that canvas.
+              private func pictureLayer(_ rect: CGRect) -> some View {
+                  let canvas = videoSize.width > 0 ? videoSize.width : 1920
+                  let k = rect.width / canvas
+                  return ZStack(alignment: .topLeading) {
+                      ForEach(pictures.indices, id: \.self) { i in
+                          let part = pictures[i]
+                          Image(uiImage: part.image)
+                              .resizable()
+                              .frame(width: part.image.size.width * k, height: part.image.size.height * k)
+                              .offset(x: part.origin.x * k, y: part.origin.y * k)
+                      }
+                  }
+                  .frame(width: rect.width, height: rect.height, alignment: .topLeading)
+                  .position(x: rect.midX, y: rect.midY)
+                  .allowsHitTesting(false)
+              }
+
               private func subtitleLayer(_ rect: CGRect) -> some View {
                   VStack(spacing: 6) {
                       Spacer()
@@ -6364,7 +6394,7 @@ jobs:
                   .position(x: rect.midX, y: rect.midY)
               }
 
-              private func controlsLayer(_ geo: GeometryProxy) -> some View {
+              private var controlsLayer: some View {
                   VStack {
                       HStack(spacing: 12) {
                           circleButton("xmark") { dismiss() }
@@ -6377,7 +6407,7 @@ jobs:
                               .shadow(color: .black.opacity(0.6), radius: 2)
                       }
                       .padding(.horizontal, 16)
-                      .padding(.top, geo.safeAreaInsets.top + 6)
+                      .padding(.top, 10)
 
                       Spacer()
 
@@ -6394,9 +6424,9 @@ jobs:
                           }
                       }
                       .padding(.horizontal, 16)
-                      .padding(.bottom, geo.safeAreaInsets.bottom + 10)
+                      .padding(.bottom, 10)
                   }
-                  .frame(width: geo.size.width, height: geo.size.height)
+                  .frame(maxWidth: .infinity, maxHeight: .infinity)
               }
 
               private var progressBar: some View {
@@ -6477,7 +6507,7 @@ jobs:
                           if !externalURLs.isEmpty {
                               Section("Добавленные") {
                                   ForEach(externalURLs, id: \.self) { file in
-                                      trackRow(file.lastPathComponent,
+                                      trackRow(externalLabel(file),
                                                selected: usingExternal && activeExternal == file) {
                                           chooseExternal(file)
                                       }
@@ -6570,6 +6600,11 @@ jobs:
 
               private var selectedEmbeddedID: String? {
                   (coordinator.subtitleModel.selectedSubtitleInfo as? FFmpegAssetTrack)?.subtitleID
+              }
+
+              private func externalLabel(_ file: URL) -> String {
+                  let name = file.deletingPathExtension().lastPathComponent
+                  return name + " · " + file.pathExtension.uppercased()
               }
 
               private func trackTitle(_ track: FFmpegAssetTrack) -> String {
@@ -6698,6 +6733,9 @@ jobs:
 
               @MainActor
               private func partsChanged(_ parts: [SubtitlePart]) {
+                  pictures = parts.compactMap { part in
+                      part.image.map { PicturePart(image: $0, origin: part.origin) }
+                  }
                   let text = parts.compactMap { $0.text?.string }
                       .joined(separator: " ")
                       .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6780,6 +6818,7 @@ jobs:
                       activeExternal = sidecar
                       externalCues = EmbeddedSubtitles.cues(fromFile: sidecar)
                       usingExternal = !externalCues.isEmpty
+                      runAutoSync(file: sidecar, automatic: true)
                   }
                   extractMessage = "субтитры: выберите дорожку"
                   let hasExternal = NativeVideoEngine.sidecarSubtitle(for: url) != nil
@@ -6804,22 +6843,31 @@ jobs:
               @MainActor
               private func autoSync() {
                   guard let file = activeExternal else {
-                      syncMessage = "Сначала выберите добавленные субтитры"
+                      syncMessage = "Сначала добавьте свои субтитры"
                       return
                   }
-                  let reference = embeddedCues.map { $0.start }
-                  guard reference.count >= 8 else {
-                      syncMessage = "Выберите встроенную текстовую дорожку и посмотрите немного (нужно около 8 реплик)"
-                      return
+                  runAutoSync(file: file, automatic: false)
+              }
+
+              /// Reference timings come from the video file itself: text cues of a text track when there is one,
+              /// otherwise the packet times of a picture track (no decoding). Works without playing the video.
+              @MainActor
+              private func runAutoSync(file: URL, automatic: Bool) {
+                  if !automatic {
+                      syncMessage = "подбираю задержку…"
                   }
-                  syncMessage = "подбираю задержку…"
+                  let video = url
                   Task { @MainActor in
-                      let result = await Task.detached(priority: .utility) {
-                          SubtitleSync.bestOffset(reference: reference,
-                                                  external: EmbeddedSubtitles.cues(fromFile: file).map { $0.start })
+                      let result = await Task.detached(priority: .utility) { () -> (delay: Double, matches: Int, total: Int)? in
+                          let reference = EmbeddedSubtitles.referenceStarts(url: video)
+                          guard reference.count >= 8 else { return nil }
+                          let external = EmbeddedSubtitles.cues(fromFile: file).map { $0.start }
+                          return SubtitleSync.bestOffset(reference: reference, external: external)
                       }.value
                       guard let result, result.matches >= max(8, result.total / 2) else {
-                          syncMessage = "Совпадений мало: похоже, файл от другой раздачи"
+                          syncMessage = automatic
+                              ? "Авто: совпадений мало, задержка не изменена"
+                              : "Совпадений мало: похоже, файл от другой раздачи"
                           return
                       }
                       subDelay = result.delay
@@ -6855,6 +6903,7 @@ jobs:
                       externalURLs.append(dest)
                   }
                   chooseExternal(dest)
+                  runAutoSync(file: dest, automatic: true)
                   if externalCues.isEmpty {
                       let raw = SubtitleSync.readText(dest) ?? ""
                       let firstLine = raw.components(separatedBy: .newlines)
@@ -6981,6 +7030,77 @@ jobs:
                       }
                   }
                   return cues.sorted { $0.start < $1.start }
+              }
+
+              struct SubStream {
+                  let index: Int
+                  let isText: Bool
+                  let language: String
+              }
+
+              static func subtitleStreams(url: URL) -> [SubStream] {
+                  var opened: UnsafeMutablePointer<AVFormatContext>? = nil
+                  guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return [] }
+                  defer {
+                      var closing: UnsafeMutablePointer<AVFormatContext>? = fmt
+                      avformat_close_input(&closing)
+                  }
+                  guard avformat_find_stream_info(fmt, nil) >= 0, let streams = fmt.pointee.streams else { return [] }
+                  var result: [SubStream] = []
+                  for i in 0..<Int(fmt.pointee.nb_streams) {
+                      guard let st = streams[i], let par = st.pointee.codecpar,
+                            par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+                      result.append(SubStream(index: i, isText: isTextCodec(par.pointee.codec_id),
+                                              language: language(of: st)))
+                  }
+                  return result
+              }
+
+              /// Start times of the subtitle track used as the timing reference for auto-sync.
+              static func referenceStarts(url: URL) -> [Double] {
+                  let japanese = ["jpn", "ja", "jap"]
+                  let streams = subtitleStreams(url: url)
+                  if let text = streams.first(where: { $0.isText && japanese.contains($0.language) })
+                      ?? streams.first(where: { $0.isText }) {
+                      return (extract(url: url, streamIndex: text.index) ?? []).map { $0.start }
+                  }
+                  if let picture = streams.first(where: { japanese.contains($0.language) }) ?? streams.first {
+                      return packetStarts(url: url, streamIndex: picture.index)
+                  }
+                  return []
+              }
+
+              /// Packet times of one track: no decoding, so it is fast even for picture tracks.
+              static func packetStarts(url: URL, streamIndex index: Int) -> [Double] {
+                  var opened: UnsafeMutablePointer<AVFormatContext>? = nil
+                  guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return [] }
+                  defer {
+                      var closing: UnsafeMutablePointer<AVFormatContext>? = fmt
+                      avformat_close_input(&closing)
+                  }
+                  guard avformat_find_stream_info(fmt, nil) >= 0, let streams = fmt.pointee.streams else { return [] }
+                  let count = Int(fmt.pointee.nb_streams)
+                  guard index >= 0, index < count, let stream = streams[index] else { return [] }
+                  let timeBase = av_q2d(stream.pointee.time_base)
+                  for i in 0..<count where i != index {
+                      streams[i]?.pointee.discard = AVDISCARD_ALL
+                  }
+                  guard let packet = av_packet_alloc() else { return [] }
+                  defer {
+                      var freed: UnsafeMutablePointer<AVPacket>? = packet
+                      av_packet_free(&freed)
+                  }
+                  var starts: [Double] = []
+                  while av_read_frame(fmt, packet) >= 0 {
+                      defer { av_packet_unref(packet) }
+                      guard Int(packet.pointee.stream_index) == index else { continue }
+                      var ts = packet.pointee.pts
+                      if ts == Int64.min { ts = packet.pointee.dts }
+                      if ts != Int64.min {
+                          starts.append(Double(ts) * timeBase)
+                      }
+                  }
+                  return starts.sorted()
               }
 
               /// Subtitle streams whose title says they are not dialogue (romaji, karaoke, signs, songs).
