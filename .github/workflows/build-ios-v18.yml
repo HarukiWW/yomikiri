@@ -94,28 +94,6 @@ jobs:
       - name: Download original JMdict files (JMnedict is still needed)
         working-directory: src
         run: pnpm run --dir ./crates/yomikiri-dictionary-generator download
-      - name: Generate the original English dictionary (the app can switch to it)
-        working-directory: src
-        run: |
-          set -euo pipefail
-          pnpm run --dir ./crates/yomikiri-dictionary-generator generate
-          mv crates/yomikiri-dictionary-generator/files/english.yomikiridict \
-             crates/yomikiri-dictionary-generator/files/original.yomikiridict
-          ls -la crates/yomikiri-dictionary-generator/files
-
-      - name: Replace JMdict with Russian dictionary
-        if: ${{ !inputs.english }}
-        env:
-          DICT_GLOB: ${{ inputs.dict_glob }}
-          DICT_CONVERTER: ${{ inputs.dict_converter }}
-        run: |
-          set -euo pipefail
-          ORIG=src/crates/yomikiri-dictionary-generator/jmdict/jmdict_english.xml
-          ls -la "$ORIG"
-          ZIP=$(ls ours/custom-dict/$DICT_GLOB | head -n1)
-          python3 "ours/custom-dict/$DICT_CONVERTER" "$ZIP" /tmp/jmdict_ru.xml --orig "$ORIG"
-          mv /tmp/jmdict_ru.xml "$ORIG"
-          ls -la "$ORIG"
       - name: Patch Rust (example sentences in dictionary entries)
         run: |
           python3 - <<'PY'
@@ -201,6 +179,28 @@ jobs:
               "pub use entry::{Kanji, PartOfSpeech, Reading, Sense, SenseExample, WordEntry};", "lib.rs"))
           print("rust patch OK")
           PY
+      - name: Generate the original English dictionary (the app can switch to it)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm run --dir ./crates/yomikiri-dictionary-generator generate
+          mv crates/yomikiri-dictionary-generator/files/english.yomikiridict \
+             crates/yomikiri-dictionary-generator/files/original.yomikiridict
+          ls -la crates/yomikiri-dictionary-generator/files
+
+      - name: Replace JMdict with Russian dictionary
+        if: ${{ !inputs.english }}
+        env:
+          DICT_GLOB: ${{ inputs.dict_glob }}
+          DICT_CONVERTER: ${{ inputs.dict_converter }}
+        run: |
+          set -euo pipefail
+          ORIG=src/crates/yomikiri-dictionary-generator/jmdict/jmdict_english.xml
+          ls -la "$ORIG"
+          ZIP=$(ls ours/custom-dict/$DICT_GLOB | head -n1)
+          python3 "ours/custom-dict/$DICT_CONVERTER" "$ZIP" /tmp/jmdict_ru.xml --orig "$ORIG"
+          mv /tmp/jmdict_ru.xml "$ORIG"
+          ls -la "$ORIG"
       - name: Add example sentences to the Russian dictionary (XML)
         if: ${{ !inputs.english }}
         env:
@@ -5119,7 +5119,7 @@ jobs:
               m = re.search(r"^import SwiftUI\n", h, re.M)
               assert m, "HelpView.swift: 'import SwiftUI' not found"
               if "import KSPlayer" not in h:
-                  h = h[: m.end()] + "import KSPlayer\n" + h[m.end():]
+                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\n" + h[m.end():]
 
               # 3a. video folder: Documents/Videos (visible in Files), migrate old App Group files once
               old_dir = (
@@ -5190,6 +5190,33 @@ jobs:
                   }
                   // subtitles are drawn by our own bar (with clickable words), not by KSPlayer
                   SubtitleModel.textColor = .clear
+                  // decode/convert frames on a separate thread: fewer dropped frames on heavy MKV files
+                  KSOptions.asynchronousDecompression = true
+              }
+
+              static func isJapanese(_ code: String?) -> Bool {
+                  guard let c = code?.lowercased() else { return false }
+                  return c == "jpn" || c == "ja" || c == "jap" || c == "japanese"
+              }
+
+              /// Japanese audio track always; Japanese embedded subtitle track unless an external subtitle is used.
+              static func selectJapanese(layer: KSPlayerLayer, coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool) {
+                  let audios = layer.player.tracks(mediaType: .audio)
+                  if let ja = audios.first(where: { isJapanese($0.languageCode) }) {
+                      layer.player.select(track: ja)
+                  }
+                  guard pickSubtitle else { return }
+                  // embedded subtitle list is filled a moment after the file is ready
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                      let infos = coordinator.subtitleModel.subtitleInfos
+                      let japanese = infos.first { info in
+                          guard let track = info as? FFmpegAssetTrack else { return false }
+                          return isJapanese(track.languageCode)
+                      }
+                      if let japanese {
+                          coordinator.subtitleModel.selectedSubtitleInfo = japanese
+                      }
+                  }
               }
 
               static func fileURL(_ name: String) -> URL {
@@ -5357,24 +5384,46 @@ jobs:
                   // The engine must be chosen before KSPlayer creates its player layer,
                   // so it is set here, when this screen is actually shown.
                   let _ = NativeVideoEngine.prepare(for: url)
-                  ZStack(alignment: .bottom) {
-                      KSVideoPlayerView(coordinator: coordinator, url: url, options: options, title: url.lastPathComponent)
-                      if !subtitleLine.isEmpty {
-                          SubtitleLookupBar(line: subtitleLine, onTap: lookup)
-                              .padding(.bottom, 64)
+                  ZStack(alignment: .top) {
+                      // title: nil -> KSPlayer does not draw the file name at the bottom of the frame
+                      KSVideoPlayerView(coordinator: coordinator, url: url, options: options, title: nil)
+                      Text(url.lastPathComponent)
+                          .font(.subheadline.weight(.semibold))
+                          .foregroundColor(.white)
+                          .lineLimit(1)
+                          .truncationMode(.tail)
+                          .padding(.horizontal, 72)
+                          .padding(.top, 50)
+                          .frame(maxWidth: .infinity)
+                          .allowsHitTesting(false)
+                      VStack {
+                          Spacer()
+                          if !subtitleLine.isEmpty {
+                              SubtitleLookupBar(line: subtitleLine, onTap: lookup)
+                                  .padding(.bottom, 56)
+                          }
                       }
                   }
                   .ignoresSafeArea()
+                  .toolbar(.hidden, for: .tabBar)
+                  .navigationBarHidden(true)
                   .onReceive(coordinator.subtitleModel.$parts) { parts in
                       subtitleLine = parts.compactMap { $0.text?.string }
                           .joined(separator: " ")
                           .trimmingCharacters(in: .whitespacesAndNewlines)
                   }
                   .onAppear {
-                      if let srt = NativeVideoEngine.sidecarSubtitle(for: url) {
+                      let sidecar = NativeVideoEngine.sidecarSubtitle(for: url)
+                      if let srt = sidecar {
                           let info = URLSubtitleInfo(url: srt)
                           coordinator.subtitleModel.addSubtitle(info: info)
                           coordinator.subtitleModel.selectedSubtitleInfo = info
+                      }
+                      coordinator.onStateChanged = { layer, state in
+                          if state == .readyToPlay {
+                              NativeVideoEngine.selectJapanese(layer: layer, coordinator: coordinator,
+                                                               pickSubtitle: sidecar == nil)
+                          }
                       }
                   }
                   .onChange(of: showLookup) { isShown in
@@ -5420,6 +5469,32 @@ jobs:
               h = h.replace(old_tab, new_tab, 1)
               hv.write_text(h, encoding="utf-8")
               print("swift: native player with lookup added")
+
+          # ---------- 4. MainView: Video tab between Dictionary and Settings ----------
+          mv = pathlib.Path("src/safari/iOS (App)/MainView.swift")
+          m_txt = mv.read_text(encoding="utf-8")
+          settings_block = (
+              "            OptionsView()\n"
+              "                .tabItem {\n"
+              "                    Label(\"Настройки\", systemImage: \"gearshape.fill\")\n"
+              "                }\n"
+              "                .tag(Tabs.settings)\n"
+          )
+          video_block = (
+              "            VideoTabView()\n"
+              "                .tabItem {\n"
+              "                    Label(\"Видео\", systemImage: \"play.rectangle.fill\")\n"
+              "                }\n"
+              "                .tag(Tabs.video)\n"
+          )
+          if m_txt.count(settings_block + video_block) == 1:
+              m_txt = m_txt.replace(settings_block + video_block, video_block + settings_block, 1)
+              mv.write_text(m_txt, encoding="utf-8")
+              print("MainView: Video tab moved before Settings")
+          elif m_txt.count(video_block + settings_block) == 1:
+              print("MainView: tab order already correct")
+          else:
+              raise SystemExit("MainView: tab blocks not found as expected")
           PY
       - name: Patch language, theme, dictionary switch, imported frequency dictionaries
         run: |
