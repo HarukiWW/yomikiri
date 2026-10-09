@@ -5981,6 +5981,14 @@ jobs:
                               }
                               if let pick = textJapanese ?? japanese.first {
                                   coordinator.subtitleModel.selectedSubtitleInfo = pick
+                                  // a track chosen at load time is often not attached yet: once playback runs,
+                                  // select it again, the same as switching tracks by hand (unless the user changed it)
+                                  try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                  if coordinator.subtitleModel.selectedSubtitleInfo?.subtitleID == pick.subtitleID {
+                                      coordinator.subtitleModel.selectedSubtitleInfo = nil
+                                      try? await Task.sleep(nanoseconds: 300_000_000)
+                                      coordinator.subtitleModel.selectedSubtitleInfo = pick
+                                  }
                               }
                               subtitleDone = true
                           }
@@ -6256,99 +6264,61 @@ jobs:
           @available(iOS 16.0, *)
           struct NativeVideoPlayerScreen: View {
               let url: URL
+              @Environment(\.dismiss) private var dismiss
               @StateObject private var coordinator = KSVideoPlayer.Coordinator()
               @State private var options = KSOptions()
-              @State private var showLookup = false
-              @State private var lookupWord = ""
-              @State private var lookupEntries: [LookupEntry] = []
-              @State private var showImporter = false
-              @State private var showSubTools = false
-              @State private var subDelay: Double = 0
+
+              // playback, polled from the player
+              @State private var playing = false
+              @State private var position: Double = 0
+              @State private var duration: Double = 0
+              @State private var scrubTo: Double? = nil
               @State private var videoSize = CGSize.zero
-              @State private var playbackTime: Double = 0
+              @State private var controlsVisible = true
+              @State private var hideTask: Task<Void, Never>? = nil
+              @State private var audioTracks: [MediaPlayerTrack] = []
+
+              // subtitles
+              @State private var line = ""                  // the line shown and searched
+              @State private var kpSubtitle = ""            // text or OCR result from KSPlayer's track
+              @State private var lastOCRKey = -1
               @State private var embeddedCues: [EmbeddedSubtitles.Cue] = []
               @State private var externalCues: [EmbeddedSubtitles.Cue] = []
-              @State private var externalURL: URL? = nil
+              @State private var externalURLs: [URL] = []   // added subtitle files, shown in the track list
+              @State private var activeExternal: URL? = nil
               @State private var usingExternal = false
-              @State private var extractMessage = "субтитры: читаю файл…"
+              @State private var trackKey = ""              // KSPlayer track we already reacted to
+              @State private var loadToken = 0
+              @State private var cueCache: [Int: [EmbeddedSubtitles.Cue]] = [:]
+              @State private var subDelay: Double = 0
+              @State private var extractMessage = ""
               @State private var syncMessage = ""
-              @State private var kpSubtitle = ""          // fallback: text from KSPlayer or OCR, used when no cues are read
-              @State private var lastOCRKey = -1
-              @State private var textParts = 0
-              @State private var imageParts = 0
-              @State private var trackKey = ""          // KSPlayer track we already reacted to
-              @State private var loadToken = 0          // ignores results of an older track
+
+              // sheets and lookup
+              @State private var showTracks = false
+              @State private var showMenu = false
+              @State private var showImporter = false
+              @State private var showLookup = false
+              @State private var lookupWord = ""
 
               private var delayKey: String { "subdelay." + url.lastPathComponent }
-              private var cueSource: [EmbeddedSubtitles.Cue] { usingExternal ? externalCues : embeddedCues }
-
-              /// The line shown and searched: taken from the cue that is on screen now (delay applied).
-              private var currentLine: String {
-                  guard !cueSource.isEmpty else { return kpSubtitle }
-                  let t = playbackTime - subDelay
-                  return cueSource.first { $0.start <= t && t < $0.end }?.text ?? ""
-              }
 
               var body: some View {
-                  // The engine must be chosen before KSPlayer creates its player layer,
-                  // so it is set here, when this screen is actually shown.
+                  // the engine must be chosen before the player layer is created
                   let _ = NativeVideoEngine.prepare(for: url)
                   GeometryReader { geo in
                       let rect = NativeVideoEngine.fitRect(in: geo.size, content: videoSize)
-                      let controls = coordinator.isMaskShow
-                      let top = geo.safeAreaInsets.top
                       ZStack {
-                          KSVideoPlayerView(coordinator: coordinator, url: url, options: options, title: nil)
+                          KSVideoPlayer(coordinator: coordinator, url: url, options: options)
                               .frame(width: geo.size.width, height: geo.size.height)
-
-                          // everything below hides together with KSPlayer's own controls
-                          if controls {
-                              Text(url.lastPathComponent)
-                                  .font(.subheadline.weight(.semibold))
-                                  .foregroundColor(.white)
-                                  .lineLimit(1)
-                                  .truncationMode(.tail)
-                                  .frame(width: max(geo.size.width - 280, 120))
-                                  .position(x: geo.size.width / 2, y: top + 24)
-                                  .allowsHitTesting(false)
-
-                              Button {
-                                  showSubTools.toggle()
-                              } label: {
-                                  Image(systemName: showSubTools ? "captions.bubble.fill" : "captions.bubble")
-                                      .font(.title3)
-                                      .foregroundColor(.white)
-                                      .padding(10)
-                                      .background(Color.black.opacity(0.5))
-                                      .clipShape(Circle())
-                              }
-                              .position(x: 60, y: top + 120)
-
-                              if showSubTools {
-                                  subToolsPanel
-                                      .frame(width: geo.size.width - 40)
-                                      .position(x: geo.size.width / 2, y: top + 180)
-                              }
+                          // a tap on the picture shows or hides the controls
+                          Color.black.opacity(0.001)
+                              .contentShape(Rectangle())
+                              .onTapGesture { toggleControls() }
+                          subtitleLayer(rect)
+                          if controlsVisible {
+                              controlsLayer(geo)
                           }
-
-                          // subtitles are drawn inside the video rectangle, so they stay with the picture
-                          VStack(spacing: 6) {
-                              Spacer()
-                              if !syncMessage.isEmpty && showSubTools && controls {
-                                  Text(syncMessage)
-                                      .font(.caption)
-                                      .foregroundColor(.white)
-                                      .padding(6)
-                                      .background(Color.black.opacity(0.6))
-                                      .cornerRadius(8)
-                              }
-                              if !currentLine.isEmpty {
-                                  SubtitleLookupBar(line: currentLine, onTap: lookup)
-                              }
-                          }
-                          .padding(.bottom, controls ? 64 : 16)
-                          .frame(width: rect.width, height: rect.height, alignment: .bottom)
-                          .position(x: rect.midX, y: rect.midY)
                       }
                       .frame(width: geo.size.width, height: geo.size.height)
                   }
@@ -6356,38 +6326,203 @@ jobs:
                   .toolbar(.hidden, for: .tabBar)
                   .navigationBarHidden(true)
                   .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
-                      checkTrack()
-                      guard let layer = coordinator.playerLayer else { return }
-                      playbackTime = layer.player.currentPlaybackTime
-                      let size = layer.player.naturalSize
-                      if size.width > 0, size.height > 0, size != videoSize {
-                          videoSize = size
-                      }
+                      tick()
                   }
                   .onReceive(coordinator.subtitleModel.$parts) { parts in
-                      textParts = parts.filter { $0.text != nil }.count
-                      imageParts = parts.filter { $0.image != nil }.count
-                      let text = parts.compactMap { $0.text?.string }
-                          .joined(separator: " ")
-                          .trimmingCharacters(in: .whitespacesAndNewlines)
-                      if !text.isEmpty {
-                          kpSubtitle = text
-                      } else if let part = parts.first(where: { $0.image != nil }), let image = part.image {
-                          let key = Int((part.start * 100).rounded())
-                          if key != lastOCRKey {
-                              lastOCRKey = key
-                              SubtitleOCR.recognize(image) { recognized in
-                                  DispatchQueue.main.async {
-                                      if key == lastOCRKey { kpSubtitle = recognized }
-                                  }
-                              }
-                          }
-                      } else {
-                          kpSubtitle = ""
-                      }
+                      partsChanged(parts)
                   }
                   .task(id: url) {
                       await loadSubtitles()
+                  }
+                  .sheet(isPresented: $showTracks) {
+                      tracksSheet
+                  }
+                  .sheet(isPresented: $showMenu) {
+                      menuSheet
+                  }
+                  .sheet(isPresented: $showLookup) {
+                      WordLookupSheet(text: lookupWord)
+                  }
+                  .onChange(of: showLookup) { shown in
+                      if !shown {
+                          coordinator.playerLayer?.play()
+                      }
+                  }
+              }
+
+              // MARK: - layers
+
+              private func subtitleLayer(_ rect: CGRect) -> some View {
+                  VStack(spacing: 6) {
+                      Spacer()
+                      if !line.isEmpty {
+                          SubtitleLookupBar(line: line, onTap: { _ in openLookup() })
+                      }
+                  }
+                  .padding(.bottom, 26)
+                  .frame(width: rect.width, height: rect.height, alignment: .bottom)
+                  .position(x: rect.midX, y: rect.midY)
+              }
+
+              private func controlsLayer(_ geo: GeometryProxy) -> some View {
+                  VStack {
+                      HStack(spacing: 12) {
+                          circleButton("xmark") { dismiss() }
+                          Text(url.lastPathComponent)
+                              .font(.subheadline.weight(.semibold))
+                              .foregroundColor(.white)
+                              .lineLimit(1)
+                              .truncationMode(.tail)
+                              .frame(maxWidth: .infinity)
+                              .shadow(color: .black.opacity(0.6), radius: 2)
+                      }
+                      .padding(.horizontal, 16)
+                      .padding(.top, geo.safeAreaInsets.top + 6)
+
+                      Spacer()
+
+                      VStack(spacing: 12) {
+                          progressBar
+                          HStack(spacing: 22) {
+                              circleButton("captions.bubble") { showTracks = true }
+                              Spacer()
+                              circleButton("gobackward.15") { skip(-15) }
+                              circleButton(playing ? "pause.fill" : "play.fill", size: 58) { togglePlay() }
+                              circleButton("goforward.15") { skip(15) }
+                              Spacer()
+                              circleButton("ellipsis") { showMenu = true }
+                          }
+                      }
+                      .padding(.horizontal, 16)
+                      .padding(.bottom, geo.safeAreaInsets.bottom + 10)
+                  }
+                  .frame(width: geo.size.width, height: geo.size.height)
+              }
+
+              private var progressBar: some View {
+                  let shown = scrubTo ?? position
+                  let fraction = duration > 0 ? min(max(shown / duration, 0), 1) : 0
+                  return VStack(spacing: 4) {
+                      GeometryReader { bar in
+                          ZStack(alignment: .leading) {
+                              Capsule()
+                                  .fill(Color.white.opacity(0.3))
+                                  .frame(height: 4)
+                              Capsule()
+                                  .fill(Color.white)
+                                  .frame(width: bar.size.width * fraction, height: 4)
+                          }
+                          .frame(height: 24)
+                          .contentShape(Rectangle())
+                          .gesture(
+                              DragGesture(minimumDistance: 0)
+                                  .onChanged { value in
+                                      let f = min(max(value.location.x / max(bar.size.width, 1), 0), 1)
+                                      scrubTo = Double(f) * duration
+                                  }
+                                  .onEnded { _ in
+                                      if let target = scrubTo {
+                                          seek(to: target)
+                                      }
+                                      scrubTo = nil
+                                  }
+                          )
+                      }
+                      .frame(height: 24)
+                      HStack {
+                          Text(clock(shown))
+                          Spacer()
+                          Text(clock(duration))
+                      }
+                      .font(.caption2.monospacedDigit())
+                      .foregroundColor(.white.opacity(0.85))
+                  }
+              }
+
+              private func circleButton(_ symbol: String, size: CGFloat = 40,
+                                        action: @escaping () -> Void) -> some View {
+                  Button {
+                      action()
+                      scheduleHide()
+                  } label: {
+                      Image(systemName: symbol)
+                          .font(.system(size: size * 0.42, weight: .semibold))
+                          .foregroundColor(.white)
+                          .frame(width: size, height: size)
+                          .background(Color.black.opacity(0.45))
+                          .clipShape(Circle())
+                  }
+              }
+
+              // MARK: - sheets
+
+              private var tracksSheet: some View {
+                  NavigationView {
+                      List {
+                          Section {
+                              trackRow("Выкл", selected: !usingExternal && selectedEmbeddedID == nil) {
+                                  chooseNone()
+                              }
+                          }
+                          if !embeddedTracks.isEmpty {
+                              Section("Встроенные") {
+                                  ForEach(embeddedTracks, id: \.subtitleID) { track in
+                                      trackRow(trackTitle(track),
+                                               selected: !usingExternal && selectedEmbeddedID == track.subtitleID) {
+                                          chooseEmbedded(track)
+                                      }
+                                  }
+                              }
+                          }
+                          if !externalURLs.isEmpty {
+                              Section("Добавленные") {
+                                  ForEach(externalURLs, id: \.self) { file in
+                                      trackRow(file.lastPathComponent,
+                                               selected: usingExternal && activeExternal == file) {
+                                          chooseExternal(file)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle("Субтитры")
+                      .navigationBarTitleDisplayMode(.inline)
+                  }
+                  .presentationDetents([.medium, .large])
+              }
+
+              private var menuSheet: some View {
+                  NavigationView {
+                      List {
+                          Section("Аудио") {
+                              if audioTracks.isEmpty {
+                                  Text("Дорожек пока нет").foregroundColor(.secondary)
+                              }
+                              ForEach(audioTracks.indices, id: \.self) { i in
+                                  let track = audioTracks[i]
+                                  trackRow(audioTitle(track), selected: track.isEnabled) {
+                                      chooseAudio(track)
+                                  }
+                              }
+                          }
+                          Section("Субтитры") {
+                              Button("Добавить свои субтитры") { showImporter = true }
+                              delayRow
+                              Button("Подобрать задержку (Авто)") { autoSync() }
+                              if !syncMessage.isEmpty {
+                                  Text(syncMessage).font(.caption).foregroundColor(.secondary)
+                              }
+                              if !extractMessage.isEmpty {
+                                  Text(extractMessage).font(.caption).foregroundColor(.secondary)
+                              }
+                          }
+                      }
+                      .navigationTitle("Настройки")
+                      .navigationBarTitleDisplayMode(.inline)
+                  }
+                  .presentationDetents([.medium, .large])
+                  .onAppear {
+                      audioTracks = coordinator.playerLayer?.player.tracks(mediaType: .audio) ?? []
                   }
                   .sheet(isPresented: $showImporter) {
                       DocumentPicker(onPick: { picked in
@@ -6397,18 +6532,90 @@ jobs:
                           showImporter = false
                       })
                   }
-                  .onChange(of: showLookup) { isShown in
-                      if !isShown {
-                          coordinator.playerLayer?.play()
-                      }
+              }
+
+              private var delayRow: some View {
+                  HStack(spacing: 10) {
+                      Button("−0.5") { shiftDelay(-0.5) }
+                      Button("−0.1") { shiftDelay(-0.1) }
+                      Text(String(format: "%+.2f с", subDelay))
+                          .font(.body.monospacedDigit())
+                          .frame(maxWidth: .infinity)
+                      Button("+0.1") { shiftDelay(0.1) }
+                      Button("+0.5") { shiftDelay(0.5) }
                   }
-                  .sheet(isPresented: $showLookup) {
-                      WordLookupSheet(text: lookupWord)
+                  .buttonStyle(.bordered)
+              }
+
+              private func trackRow(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+                  Button(action: action) {
+                      HStack {
+                          Text(title)
+                              .foregroundColor(.primary)
+                              .lineLimit(2)
+                          Spacer()
+                          if selected {
+                              Image(systemName: "checkmark")
+                                  .foregroundColor(.accentColor)
+                          }
+                      }
                   }
               }
 
-              /// Reacts to the subtitle track chosen in KSPlayer's menu.
-              /// Text track -> its cues are read from the file; picture track -> OCR of the picture.
+              // MARK: - tracks
+
+              private var embeddedTracks: [FFmpegAssetTrack] {
+                  coordinator.subtitleModel.subtitleInfos.compactMap { $0 as? FFmpegAssetTrack }
+              }
+
+              private var selectedEmbeddedID: String? {
+                  (coordinator.subtitleModel.selectedSubtitleInfo as? FFmpegAssetTrack)?.subtitleID
+              }
+
+              private func trackTitle(_ track: FFmpegAssetTrack) -> String {
+                  let language = (track.languageCode ?? "").uppercased()
+                  let kind = track.isImageSubtitle ? "картинки" : "текст"
+                  return [language, track.name, kind].filter { !$0.isEmpty }.joined(separator: " · ")
+              }
+
+              private func audioTitle(_ track: MediaPlayerTrack) -> String {
+                  let language = (track.languageCode ?? "").uppercased()
+                  let title = [language, track.name].filter { !$0.isEmpty }.joined(separator: " · ")
+                  return title.isEmpty ? "Дорожка \(track.trackID)" : title
+              }
+
+              private func chooseNone() {
+                  usingExternal = false
+                  activeExternal = nil
+                  coordinator.subtitleModel.selectedSubtitleInfo = nil
+                  showTracks = false
+              }
+
+              private func chooseEmbedded(_ track: FFmpegAssetTrack) {
+                  usingExternal = false
+                  activeExternal = nil
+                  coordinator.subtitleModel.selectedSubtitleInfo = track
+                  showTracks = false
+              }
+
+              private func chooseExternal(_ file: URL) {
+                  activeExternal = file
+                  externalCues = EmbeddedSubtitles.cues(fromFile: file)
+                  usingExternal = !externalCues.isEmpty
+                  coordinator.subtitleModel.selectedSubtitleInfo = nil
+                  showTracks = false
+                  syncMessage = externalCues.isEmpty
+                      ? "В файле не найдено реплик"
+                      : "Субтитры: \(externalCues.count) реплик"
+              }
+
+              private func chooseAudio(_ track: MediaPlayerTrack) {
+                  coordinator.playerLayer?.player.select(track: track)
+                  audioTracks = coordinator.playerLayer?.player.tracks(mediaType: .audio) ?? []
+              }
+
+              /// Follows the track chosen in KSPlayer: text -> cues from the file, picture -> OCR.
+              @MainActor
               private func checkTrack() {
                   let selected = coordinator.subtitleModel.selectedSubtitleInfo
                   let key = selected.map { ($0 is FFmpegAssetTrack ? "e" : "x") + $0.subtitleID } ?? ""
@@ -6418,11 +6625,9 @@ jobs:
                       embeddedCues = []
                       return
                   }
-                  guard let track = selected as? FFmpegAssetTrack else {
-                      // external subtitle picked in KSPlayer (not used by this player)
-                      return
-                  }
+                  guard let track = selected as? FFmpegAssetTrack else { return }
                   usingExternal = false
+                  activeExternal = nil
                   if track.isImageSubtitle {
                       embeddedCues = []
                       extractMessage = "дорожка картинками: текст распознаётся (OCR)"
@@ -6431,88 +6636,160 @@ jobs:
                   loadToken += 1
                   let token = loadToken
                   let index = Int(track.trackID)
+                  if let cached = cueCache[index] {
+                      // this track was read already in this session: no second pass over the file
+                      embeddedCues = cached
+                      extractMessage = trackMessage(cached.count)
+                      return
+                  }
                   let videoURL = url
-                  Task {
+                  Task { @MainActor in
                       let cues = await Task.detached(priority: .utility) {
                           EmbeddedSubtitles.extract(url: videoURL, streamIndex: index) ?? []
                       }.value
+                      cueCache[index] = cues
                       guard token == loadToken else { return }
                       embeddedCues = cues
-                      extractMessage = cues.isEmpty
-                          ? "в этой дорожке текста не найдено"
-                          : "субтитры из дорожки: \(cues.count) реплик"
+                      extractMessage = trackMessage(cues.count)
                   }
               }
+
+              private func trackMessage(_ count: Int) -> String {
+                  count == 0 ? "в этой дорожке текста не найдено" : "субтитры из дорожки: \(count) реплик"
+              }
+
+              // MARK: - playback
+
+              @MainActor
+              private func tick() {
+                  checkTrack()
+                  if let layer = coordinator.playerLayer {
+                      let player = layer.player
+                      if playing != player.isPlaying {
+                          playing = player.isPlaying
+                      }
+                      if scrubTo == nil {
+                          position = player.currentPlaybackTime
+                      }
+                      if player.duration > 0, player.duration != duration {
+                          duration = player.duration
+                      }
+                      let size = player.naturalSize
+                      if size.width > 0, size.height > 0, size != videoSize {
+                          videoSize = size
+                      }
+                  }
+                  updateLine()
+              }
+
+              private func updateLine() {
+                  let t = position - subDelay
+                  let source = usingExternal ? externalCues : embeddedCues
+                  let next: String
+                  if source.isEmpty {
+                      next = kpSubtitle
+                  } else {
+                      next = source.first { $0.start <= t && t < $0.end }?.text ?? ""
+                  }
+                  if next != line {
+                      line = next
+                  }
+              }
+
+              @MainActor
+              private func partsChanged(_ parts: [SubtitlePart]) {
+                  let text = parts.compactMap { $0.text?.string }
+                      .joined(separator: " ")
+                      .trimmingCharacters(in: .whitespacesAndNewlines)
+                  if !text.isEmpty {
+                      kpSubtitle = text
+                  } else if let part = parts.first(where: { $0.image != nil }), let image = part.image {
+                      let key = Int((part.start * 100).rounded())
+                      if key != lastOCRKey {
+                          lastOCRKey = key
+                          SubtitleOCR.recognize(image) { recognized in
+                              DispatchQueue.main.async {
+                                  if key == lastOCRKey {
+                                      kpSubtitle = recognized
+                                  }
+                              }
+                          }
+                      }
+                  } else {
+                      kpSubtitle = ""
+                  }
+              }
+
+              private func togglePlay() {
+                  guard let layer = coordinator.playerLayer else { return }
+                  if layer.player.isPlaying {
+                      layer.pause()
+                  } else {
+                      layer.play()
+                  }
+                  playing = !playing
+              }
+
+              private func skip(_ by: Double) {
+                  seek(to: min(max(position + by, 0), duration))
+              }
+
+              private func seek(to time: Double) {
+                  position = time
+                  coordinator.playerLayer?.player.seek(time: time) { _ in }
+              }
+
+              private func clock(_ seconds: Double) -> String {
+                  guard seconds.isFinite, seconds > 0 else { return "0:00" }
+                  let total = Int(seconds)
+                  let h = total / 3600
+                  let m = (total % 3600) / 60
+                  let s = total % 60
+                  return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+              }
+
+              // MARK: - controls visibility
+
+              private func toggleControls() {
+                  if controlsVisible {
+                      controlsVisible = false
+                      hideTask?.cancel()
+                  } else {
+                      controlsVisible = true
+                      scheduleHide()
+                  }
+              }
+
+              private func scheduleHide() {
+                  hideTask?.cancel()
+                  hideTask = Task { @MainActor in
+                      try? await Task.sleep(nanoseconds: 3_500_000_000)
+                      if !Task.isCancelled, playing {
+                          controlsVisible = false
+                      }
+                  }
+              }
+
+              // MARK: - loading, delay, import, lookup
 
               @MainActor
               private func loadSubtitles() async {
                   subDelay = UserDefaults.standard.double(forKey: delayKey)
                   if let sidecar = NativeVideoEngine.sidecarSubtitle(for: url) {
-                      externalURL = sidecar
+                      externalURLs = [sidecar]
+                      activeExternal = sidecar
                       externalCues = EmbeddedSubtitles.cues(fromFile: sidecar)
                       usingExternal = !externalCues.isEmpty
                   }
-                  // the subtitle text follows the track chosen in KSPlayer's subtitle menu (checkTrack);
-                  // Japanese is chosen by default, the external file is not replaced by the default choice
-                  extractMessage = "субтитры: выберите дорожку в меню субтитров"
+                  extractMessage = "субтитры: выберите дорожку"
                   let hasExternal = NativeVideoEngine.sidecarSubtitle(for: url) != nil
                   let videoURL = url
-                  let excluded = await Task.detached(priority: .utility) {
+                  let skipped = await Task.detached(priority: .utility) {
                       EmbeddedSubtitles.nonDialogueStreams(url: videoURL)
                   }.value
-                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: !hasExternal,
-                                                             excluded: excluded)
-              }
-
-              private var subToolsPanel: some View {
-                  VStack(spacing: 6) {
-                      ScrollView(.horizontal, showsIndicators: false) {
-                          HStack(spacing: 8) {
-                              toolButton("Добавить свои") { showImporter = true }
-                              if !embeddedCues.isEmpty && !externalCues.isEmpty {
-                                  toolButton(usingExternal ? "Источник: файл" : "Источник: видео") {
-                                      usingExternal.toggle()
-                                  }
-                              }
-                              toolButton("−0.5") { shiftDelay(-0.5) }
-                              toolButton("−0.1") { shiftDelay(-0.1) }
-                              Text(String(format: "%+.2f с", subDelay))
-                                  .font(.caption.monospacedDigit())
-                                  .foregroundColor(.white)
-                                  .fixedSize()
-                              toolButton("+0.1") { shiftDelay(0.1) }
-                              toolButton("+0.5") { shiftDelay(0.5) }
-                              toolButton("Авто") { autoSync() }
-                          }
-                          .padding(.horizontal, 4)
-                      }
-                      Text(extractMessage)
-                          .font(.caption2)
-                          .foregroundColor(.white.opacity(0.8))
-                          .lineLimit(1)
-                      if !syncMessage.isEmpty {
-                          Text(syncMessage)
-                              .font(.caption)
-                              .foregroundColor(.white)
-                              .lineLimit(2)
-                      }
-                  }
-                  .padding(8)
-                  .background(Color.black.opacity(0.65))
-                  .cornerRadius(10)
-              }
-
-              private func toolButton(_ title: String, _ action: @escaping () -> Void) -> some View {
-                  Button(action: action) {
-                      Text(title)
-                          .font(.caption.weight(.semibold))
-                          .foregroundColor(.white)
-                          .fixedSize()
-                          .padding(.horizontal, 10)
-                          .padding(.vertical, 6)
-                          .background(Color.black.opacity(0.6))
-                          .cornerRadius(8)
-                  }
+                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator,
+                                                             pickSubtitle: !hasExternal,
+                                                             excluded: skipped)
               }
 
               private func shiftDelay(_ by: Double) {
@@ -6524,34 +6801,40 @@ jobs:
                   UserDefaults.standard.set(subDelay, forKey: delayKey)
               }
 
+              @MainActor
               private func autoSync() {
-                  guard let ext = externalURL else {
-                      syncMessage = "Сначала добавьте свои субтитры"
+                  guard let file = activeExternal else {
+                      syncMessage = "Сначала выберите добавленные субтитры"
                       return
                   }
-                  guard embeddedCues.count >= 8 else {
-                      syncMessage = "Встроенных текстовых субтитров мало для подбора (нужно около 8 реплик)"
+                  let reference = embeddedCues.map { $0.start }
+                  guard reference.count >= 8 else {
+                      syncMessage = "Выберите встроенную текстовую дорожку и посмотрите немного (нужно около 8 реплик)"
                       return
                   }
-                  let external = EmbeddedSubtitles.cues(fromFile: ext).map { $0.start }
-                  guard !external.isEmpty else {
-                      syncMessage = "В своём файле не найдено реплик"
-                      return
+                  syncMessage = "подбираю задержку…"
+                  Task { @MainActor in
+                      let result = await Task.detached(priority: .utility) {
+                          SubtitleSync.bestOffset(reference: reference,
+                                                  external: EmbeddedSubtitles.cues(fromFile: file).map { $0.start })
+                      }.value
+                      guard let result, result.matches >= max(8, result.total / 2) else {
+                          syncMessage = "Совпадений мало: похоже, файл от другой раздачи"
+                          return
+                      }
+                      subDelay = result.delay
+                      applyDelay()
+                      syncMessage = String(format: "Подобрано: %+.2f с (совпало %d из %d)",
+                                           result.delay, result.matches, result.total)
                   }
-                  guard let result = SubtitleSync.bestOffset(reference: embeddedCues.map { $0.start }, external: external),
-                        result.matches >= max(8, result.total / 2) else {
-                      syncMessage = "Совпадений мало: похоже, файл от другой раздачи"
-                      return
-                  }
-                  subDelay = result.delay
-                  applyDelay()
-                  syncMessage = String(format: "Подобрано: %+.2f с (совпало %d из %d)",
-                                       result.delay, result.matches, result.total)
               }
 
+              @MainActor
               private func addExternalSubtitle(_ src: URL) {
                   let access = src.startAccessingSecurityScopedResource()
-                  defer { if access { src.stopAccessingSecurityScopedResource() } }
+                  defer {
+                      if access { src.stopAccessingSecurityScopedResource() }
+                  }
                   let ext = src.pathExtension.lowercased()
                   guard ["srt", "ass", "ssa", "vtt"].contains(ext) else {
                       syncMessage = "Поддерживаются .srt, .ass, .ssa и .vtt"
@@ -6568,23 +6851,22 @@ jobs:
                       syncMessage = "Не удалось скопировать субтитры: \(error.localizedDescription)"
                       return
                   }
-                  externalURL = dest
-                  externalCues = EmbeddedSubtitles.cues(fromFile: dest)
-                  usingExternal = !externalCues.isEmpty
+                  if !externalURLs.contains(dest) {
+                      externalURLs.append(dest)
+                  }
+                  chooseExternal(dest)
                   if externalCues.isEmpty {
                       let raw = SubtitleSync.readText(dest) ?? ""
                       let firstLine = raw.components(separatedBy: .newlines)
                           .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
                       syncMessage = "В файле не найдено реплик: символов \(raw.count), первая строка: «\(String(firstLine.prefix(40)))»"
-                  } else {
-                      syncMessage = "Субтитры добавлены: \(externalCues.count) реплик"
                   }
               }
 
-              private func lookup(_ token: LookupToken) {
-                  // the whole line goes to the dictionary page: its mining uses the sentence as context
-                  lookupWord = currentLine
+              private func openLookup() {
+                  lookupWord = line
                   coordinator.playerLayer?.pause()
+                  playing = false
                   showLookup = true
               }
           }
@@ -6934,6 +7216,50 @@ jobs:
               print("MainView: tab order already correct")
           else:
               raise SystemExit("MainView: tab blocks not found as expected")
+          PY
+
+      - name: Optimizations - shared formatters
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          # ---------- statistics: one NumberFormatter instead of one per row ----------
+          hv = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          t = hv.read_text(encoding="utf-8")
+          old_num = '''private func statNumber(_ n: Int) -> String {
+              let formatter = NumberFormatter()
+              formatter.numberStyle = .decimal
+              formatter.locale = Locale(identifier: "ru_RU")
+              return formatter.string(from: NSNumber(value: n)) ?? String(n)
+          }'''
+          if old_num in t:
+              t = t.replace(old_num, '''private let statNumberFormatter: NumberFormatter = {
+              let formatter = NumberFormatter()
+              formatter.numberStyle = .decimal
+              formatter.locale = Locale(identifier: "ru_RU")
+              return formatter
+          }()
+
+          private func statNumber(_ n: Int) -> String {
+              return statNumberFormatter.string(from: NSNumber(value: n)) ?? String(n)
+          }''')
+              hv.write_text(t, encoding="utf-8")
+              print("statistics: number formatter is shared")
+          else:
+              print("statistics: pattern not in this build, skipped")
+
+          # ---------- extension journal: one ISO formatter instead of one per request ----------
+          ut = pathlib.Path("src/safari/YomikiriTokenizer/YomikiriTokenizer/Utils.swift")
+          u = ut.read_text(encoding="utf-8")
+          old_stamp = "    let stamp = ISO8601DateFormatter().string(from: Date())\n"
+          if old_stamp in u:
+              u = u.replace(old_stamp, "    let stamp = extLogStamp.string(from: Date())\n")
+              u = u.replace("/// Short request log shared by the app and the Safari extension",
+                            "private let extLogStamp = ISO8601DateFormatter()\n\n/// Short request log shared by the app and the Safari extension", 1)
+              ut.write_text(u, encoding="utf-8")
+              print("journal: timestamp formatter is shared")
+          else:
+              print("journal: not in this build, skipped")
           PY
 
       - name: Pre-generate files that Xcode expects to already exist
