@@ -5100,6 +5100,58 @@ jobs:
               pb.write_text(s, encoding="utf-8")
               print("pbxproj: KSPlayer 2.3.4 added to Yomikiri (iOS)")
 
+          # ---------- 1b. Xcode project: FFmpegKit product (C modules Libavformat/Libavcodec/Libavutil) ----------
+          pb2 = pathlib.Path("src/safari/Yomikiri.xcodeproj/project.pbxproj")
+          s2 = pb2.read_text(encoding="utf-8")
+          if "FFmpegKit" in s2:
+              print("pbxproj: FFmpegKit already present")
+          else:
+              FPKG = "C6A1B2C3D4E5F60718293B01"
+              FPROD = "C6A1B2C3D4E5F60718293B02"
+              FBF = "C6A1B2C3D4E5F60718293B03"
+              for uid in (FPKG, FPROD, FBF):
+                  assert s2.count(uid) == 0, "id collision: " + uid
+
+              def once2(text, old, new, label):
+                  n = text.count(old)
+                  assert n == 1, "pbxproj FFmpegKit: %s found %d times" % (label, n)
+                  return text.replace(old, new)
+
+              s2 = once2(s2, "/* Begin PBXBuildFile section */\n",
+                         "/* Begin PBXBuildFile section */\n"
+                         "\t\t%s /* FFmpegKit in Frameworks */ = {isa = PBXBuildFile; productRef = %s /* FFmpegKit */; };\n" % (FBF, FPROD),
+                         "PBXBuildFile begin")
+              s2 = once2(s2, "\t\t\t\t%s /* KSPlayer in Frameworks */,\n" % "C6A1B2C3D4E5F60718293A03",
+                         "\t\t\t\tC6A1B2C3D4E5F60718293A03 /* KSPlayer in Frameworks */,\n\t\t\t\t%s /* FFmpegKit in Frameworks */,\n" % FBF,
+                         "frameworks phase")
+              s2 = once2(s2, "\t\t\t\tC6A1B2C3D4E5F60718293A02 /* KSPlayer */,\n",
+                         "\t\t\t\tC6A1B2C3D4E5F60718293A02 /* KSPlayer */,\n\t\t\t\t%s /* FFmpegKit */,\n" % FPROD,
+                         "packageProductDependencies")
+              s2 = once2(s2, "\t\t\t\tC6A1B2C3D4E5F60718293A01 /* XCRemoteSwiftPackageReference \"KSPlayer\" */,\n",
+                         "\t\t\t\tC6A1B2C3D4E5F60718293A01 /* XCRemoteSwiftPackageReference \"KSPlayer\" */,\n\t\t\t\t%s /* XCRemoteSwiftPackageReference \"FFmpegKit\" */,\n" % FPKG,
+                         "packageReferences")
+              s2 = once2(s2, "/* End XCRemoteSwiftPackageReference section */\n",
+                         "\t\t%s /* XCRemoteSwiftPackageReference \"FFmpegKit\" */ = {\n"
+                         "\t\t\tisa = XCRemoteSwiftPackageReference;\n"
+                         "\t\t\trepositoryURL = \"https://github.com/kingslay/FFmpegKit.git\";\n"
+                         "\t\t\trequirement = {\n"
+                         "\t\t\t\tkind = upToNextMajorVersion;\n"
+                         "\t\t\t\tminimumVersion = 6.1.3;\n"
+                         "\t\t\t};\n"
+                         "\t\t};\n"
+                         "/* End XCRemoteSwiftPackageReference section */\n" % FPKG,
+                         "end package refs")
+              s2 = once2(s2, "/* End XCSwiftPackageProductDependency section */\n",
+                         "\t\t%s /* FFmpegKit */ = {\n"
+                         "\t\t\tisa = XCSwiftPackageProductDependency;\n"
+                         "\t\t\tpackage = %s /* XCRemoteSwiftPackageReference \"FFmpegKit\" */;\n"
+                         "\t\t\tproductName = FFmpegKit;\n"
+                         "\t\t};\n"
+                         "/* End XCSwiftPackageProductDependency section */\n" % (FPROD, FPKG),
+                         "end product deps")
+              pb2.write_text(s2, encoding="utf-8")
+              print("pbxproj: FFmpegKit linked to Yomikiri (iOS)")
+
           # ---------- 2. Info.plist: make Documents visible in the Files app ----------
           plist_path = pathlib.Path("src/safari/iOS (App)/Info.plist")
           with plist_path.open("rb") as f:
@@ -5119,7 +5171,7 @@ jobs:
               m = re.search(r"^import SwiftUI\n", h, re.M)
               assert m, "HelpView.swift: 'import SwiftUI' not found"
               if "import KSPlayer" not in h:
-                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\nimport UniformTypeIdentifiers\nimport UIKit\nimport Vision\n" + h[m.end():]
+                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\nimport UniformTypeIdentifiers\nimport UIKit\nimport Vision\nimport Libavcodec\nimport Libavformat\nimport Libavutil\n" + h[m.end():]
 
               # 3a. video folder: Documents/Videos (visible in Files), migrate old App Group files once
               old_dir = (
@@ -5506,23 +5558,34 @@ jobs:
               let url: URL
               @StateObject private var coordinator = KSVideoPlayer.Coordinator()
               @State private var options = KSOptions()
-              @State private var subtitleLine = ""
-              @State private var textParts = 0
-              @State private var imageParts = 0
-              @State private var trackName = ""
+              @State private var showLookup = false
               @State private var lookupWord = ""
               @State private var lookupEntries: [LookupEntry] = []
-              @State private var showLookup = false
               @State private var showImporter = false
               @State private var showSubTools = false
               @State private var subDelay: Double = 0
-              @State private var refStarts: [Double] = []     // timings of the embedded track, collected while playing
-              @State private var refKeys = Set<Int>()
-              @State private var syncMessage = ""
               @State private var videoSize = CGSize.zero
+              @State private var playbackTime: Double = 0
+              @State private var embeddedCues: [EmbeddedSubtitles.Cue] = []
+              @State private var externalCues: [EmbeddedSubtitles.Cue] = []
+              @State private var externalURL: URL? = nil
+              @State private var usingExternal = false
+              @State private var extractMessage = "субтитры: читаю файл…"
+              @State private var syncMessage = ""
+              @State private var kpSubtitle = ""          // fallback: text from KSPlayer or OCR, used when no cues are read
               @State private var lastOCRKey = -1
+              @State private var textParts = 0
+              @State private var imageParts = 0
 
               private var delayKey: String { "subdelay." + url.lastPathComponent }
+              private var cueSource: [EmbeddedSubtitles.Cue] { usingExternal ? externalCues : embeddedCues }
+
+              /// The line shown and searched: taken from the cue that is on screen now (delay applied).
+              private var currentLine: String {
+                  guard !cueSource.isEmpty else { return kpSubtitle }
+                  let t = playbackTime - subDelay
+                  return cueSource.first { $0.start <= t && t < $0.end }?.text ?? ""
+              }
 
               var body: some View {
                   // The engine must be chosen before KSPlayer creates its player layer,
@@ -5577,8 +5640,8 @@ jobs:
                                       .background(Color.black.opacity(0.6))
                                       .cornerRadius(8)
                               }
-                              if !subtitleLine.isEmpty {
-                                  SubtitleLookupBar(line: subtitleLine, onTap: lookup)
+                              if !currentLine.isEmpty {
+                                  SubtitleLookupBar(line: currentLine, onTap: lookup)
                               }
                           }
                           .padding(.bottom, controls ? 64 : 16)
@@ -5590,53 +5653,43 @@ jobs:
                   .ignoresSafeArea()
                   .toolbar(.hidden, for: .tabBar)
                   .navigationBarHidden(true)
-                  .onReceive(Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()) { _ in
-                      if let size = coordinator.playerLayer?.player.naturalSize,
-                         size.width > 0, size.height > 0, size != videoSize {
+                  .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
+                      guard let layer = coordinator.playerLayer else { return }
+                      playbackTime = layer.player.currentPlaybackTime
+                      let size = layer.player.naturalSize
+                      if size.width > 0, size.height > 0, size != videoSize {
                           videoSize = size
                       }
                   }
                   .onReceive(coordinator.subtitleModel.$parts) { parts in
                       textParts = parts.filter { $0.text != nil }.count
                       imageParts = parts.filter { $0.image != nil }.count
-                      trackName = coordinator.subtitleModel.selectedSubtitleInfo?.name ?? "выключены"
                       let text = parts.compactMap { $0.text?.string }
                           .joined(separator: " ")
                           .trimmingCharacters(in: .whitespacesAndNewlines)
                       if !text.isEmpty {
-                          subtitleLine = text
+                          kpSubtitle = text
                       } else if let part = parts.first(where: { $0.image != nil }), let image = part.image {
                           let key = Int((part.start * 100).rounded())
                           if key != lastOCRKey {
                               lastOCRKey = key
                               SubtitleOCR.recognize(image) { recognized in
                                   DispatchQueue.main.async {
-                                      if key == lastOCRKey { subtitleLine = recognized }
+                                      if key == lastOCRKey { kpSubtitle = recognized }
                                   }
                               }
                           }
                       } else {
-                          subtitleLine = ""
-                      }
-                      collectReference(parts)
-                  }
-                  .onAppear {
-                      subDelay = UserDefaults.standard.double(forKey: delayKey)
-                      coordinator.subtitleModel.subtitleDelay = subDelay
-                      if let srt = NativeVideoEngine.sidecarSubtitle(for: url) {
-                          let info = URLSubtitleInfo(url: srt)
-                          coordinator.subtitleModel.addSubtitle(info: info)
-                          coordinator.subtitleModel.selectedSubtitleInfo = info
+                          kpSubtitle = ""
                       }
                   }
                   .task(id: url) {
-                      await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator,
-                                                                 pickSubtitle: NativeVideoEngine.sidecarSubtitle(for: url) == nil)
+                      await loadSubtitles()
                   }
                   .sheet(isPresented: $showImporter) {
-                      DocumentPicker(onPick: { url in
+                      DocumentPicker(onPick: { picked in
                           showImporter = false
-                          addExternalSubtitle(url)
+                          addExternalSubtitle(picked)
                       }, onCancel: {
                           showImporter = false
                       })
@@ -5647,8 +5700,30 @@ jobs:
                       }
                   }
                   .sheet(isPresented: $showLookup) {
-                      LookupSheet(word: lookupWord, entries: lookupEntries)
+                      WordLookupSheet(text: lookupWord)
                   }
+              }
+
+              @MainActor
+              private func loadSubtitles() async {
+                  subDelay = UserDefaults.standard.double(forKey: delayKey)
+                  if let sidecar = NativeVideoEngine.sidecarSubtitle(for: url) {
+                      externalURL = sidecar
+                      externalCues = EmbeddedSubtitles.cues(fromFile: sidecar)
+                      usingExternal = !externalCues.isEmpty
+                  }
+                  // reading the file is done in the background, the picture is not waiting for it
+                  let videoURL = url
+                  let cues = await Task.detached(priority: .utility) {
+                      EmbeddedSubtitles.extract(url: videoURL) ?? []
+                  }.value
+                  embeddedCues = cues
+                  if cues.isEmpty {
+                      extractMessage = "в файле нет текстовых субтитров (картинки и OCR — запасной вариант)"
+                  } else {
+                      extractMessage = "субтитры из файла: \(cues.count) реплик"
+                  }
+                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: false)
               }
 
               private var subToolsPanel: some View {
@@ -5656,6 +5731,11 @@ jobs:
                       ScrollView(.horizontal, showsIndicators: false) {
                           HStack(spacing: 8) {
                               toolButton("Добавить свои") { showImporter = true }
+                              if !embeddedCues.isEmpty && !externalCues.isEmpty {
+                                  toolButton(usingExternal ? "Источник: файл" : "Источник: видео") {
+                                      usingExternal.toggle()
+                                  }
+                              }
                               toolButton("−0.5") { shiftDelay(-0.5) }
                               toolButton("−0.1") { shiftDelay(-0.1) }
                               Text(String(format: "%+.2f с", subDelay))
@@ -5668,7 +5748,7 @@ jobs:
                           }
                           .padding(.horizontal, 4)
                       }
-                      Text("Дорожка: \(trackName) · текст: \(textParts) · картинки: \(imageParts)")
+                      Text(extractMessage)
                           .font(.caption2)
                           .foregroundColor(.white.opacity(0.8))
                           .lineLimit(1)
@@ -5697,42 +5777,30 @@ jobs:
                   }
               }
 
-              private func collectReference(_ parts: [SubtitlePart]) {
-                  // only timings of the embedded (container) track are a valid reference
-                  guard coordinator.subtitleModel.selectedSubtitleInfo is FFmpegAssetTrack else { return }
-                  for part in parts {
-                      let key = Int((part.start * 100).rounded())
-                      if refKeys.insert(key).inserted, refStarts.count < 5000 {
-                          refStarts.append(part.start)
-                      }
-                  }
-              }
-
               private func shiftDelay(_ by: Double) {
                   subDelay = ((subDelay + by) * 100).rounded() / 100
                   applyDelay()
               }
 
               private func applyDelay() {
-                  coordinator.subtitleModel.subtitleDelay = subDelay
                   UserDefaults.standard.set(subDelay, forKey: delayKey)
               }
 
               private func autoSync() {
-                  guard let info = coordinator.subtitleModel.selectedSubtitleInfo as? URLSubtitleInfo else {
-                      syncMessage = "Сначала добавьте или выберите свои субтитры"
+                  guard let ext = externalURL else {
+                      syncMessage = "Сначала добавьте свои субтитры"
                       return
                   }
-                  guard refStarts.count >= 8 else {
-                      syncMessage = "Посмотрите немного встроенных субтитров (нужно около 8 реплик) и нажмите снова"
+                  guard embeddedCues.count >= 8 else {
+                      syncMessage = "Встроенных текстовых субтитров мало для подбора (нужно около 8 реплик)"
                       return
                   }
-                  guard let text = SubtitleSync.readText(info.downloadURL) else {
-                      syncMessage = "Не удалось прочитать файл субтитров"
+                  let external = EmbeddedSubtitles.cues(fromFile: ext).map { $0.start }
+                  guard !external.isEmpty else {
+                      syncMessage = "В своём файле не найдено реплик"
                       return
                   }
-                  let external = SubtitleSync.cueStarts(text)
-                  guard let result = SubtitleSync.bestOffset(reference: refStarts, external: external),
+                  guard let result = SubtitleSync.bestOffset(reference: embeddedCues.map { $0.start }, external: external),
                         result.matches >= max(8, result.total / 2) else {
                       syncMessage = "Совпадений мало: похоже, файл от другой раздачи"
                       return
@@ -5762,16 +5830,17 @@ jobs:
                       syncMessage = "Не удалось скопировать субтитры: \(error.localizedDescription)"
                       return
                   }
-                  let info = URLSubtitleInfo(url: dest)
-                  coordinator.subtitleModel.addSubtitle(info: info)
-                  coordinator.subtitleModel.selectedSubtitleInfo = info
-                  syncMessage = "Субтитры добавлены: \(src.lastPathComponent)"
+                  externalURL = dest
+                  externalCues = EmbeddedSubtitles.cues(fromFile: dest)
+                  usingExternal = !externalCues.isEmpty
+                  syncMessage = externalCues.isEmpty
+                      ? "В файле не найдено реплик"
+                      : "Субтитры добавлены: \(externalCues.count) реплик"
               }
 
               private func lookup(_ token: LookupToken) {
-                  let result = NativeLookup.tokenize(subtitleLine, charAt: token.start)
-                  lookupWord = token.text
-                  lookupEntries = result.entries
+                  // the whole line goes to the dictionary page: its mining uses the sentence as context
+                  lookupWord = currentLine
                   coordinator.playerLayer?.pause()
                   showLookup = true
               }
@@ -5837,6 +5906,38 @@ jobs:
                   func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
                       onCancel()
                   }
+              }
+          }
+
+          /// Browser-like lookup: the app's dictionary page (tokens, entries, mining to Anki),
+          /// opened on the subtitle text, the same page the dictionary tab shows.
+          @available(iOS 16.0, *)
+          struct WordLookupSheet: View {
+              let text: String
+
+              private var pageURL: URL? {
+                  let page = Bundle.main.url(forResource: "dictionary", withExtension: "html", subdirectory: "res")
+                  return page?.withPathComponents([
+                      URLQueryItem(name: "context", value: "app"),
+                      URLQueryItem(name: "search", value: text),
+                  ])
+              }
+
+              var body: some View {
+                  Group {
+                      if let url = pageURL {
+                          YomikiriWebView(url: url)
+                              .scrollable(false)
+                              .overscroll(false)
+                              .ignoresSafeArea(.keyboard)
+                      } else {
+                          Text("Страница словаря не найдена в приложении")
+                              .foregroundColor(.secondary)
+                              .padding()
+                      }
+                  }
+                  .presentationDetents([.medium, .large])
+                  .presentationDragIndicator(.visible)
               }
           }
 
@@ -7412,6 +7513,27 @@ jobs:
               s = s.replace(old, new)
           p.write_text(s)
           print("v3 patch OK")
+          PY
+
+      - name: Non-blocking imported frequency dictionaries (lookups and highlights in Safari)
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          # ---------- imported frequency dictionaries must not block a lookup ----------
+          freq = pathlib.Path("src/main/src/lib/frequencyLookup.ts")
+          f = freq.read_text(encoding="utf-8")
+          old_all = "async function allTables(): Promise<FreqTable[]> {\n  await refreshCustom();\n"
+          if old_all in f:
+              f = f.replace(old_all,
+                            "async function allTables(): Promise<FreqTable[]> {\n"
+                            "  // do not wait for the app's imported dictionaries: a lookup must never hang on them\n"
+                            "  void refreshCustom();\n")
+              freq.write_text(f, encoding="utf-8")
+              print("frequency: lookups no longer wait for imported dictionaries")
+          else:
+              assert "void refreshCustom();" in f, "allTables changed"
+              print("frequency: already non-blocking")
           PY
 
       - name: Pre-generate files that Xcode expects to already exist
