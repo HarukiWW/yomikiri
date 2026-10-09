@@ -5981,8 +5981,16 @@ jobs:
                               }
                               if let saved = savedChoice {
                                   // the choice of the last session wins; "" means no subtitles
-                                  if let match = infos.first(where: { $0.subtitleID == saved }) {
+                                  if !saved.isEmpty,
+                                     let match = coordinator.subtitleModel.subtitleInfos.first(where: { $0.subtitleID == saved }) {
                                       coordinator.subtitleModel.selectedSubtitleInfo = match
+                                      // KSPlayer picks its own default track right after: select the saved one again
+                                      try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                      if coordinator.subtitleModel.selectedSubtitleInfo?.subtitleID != match.subtitleID {
+                                          coordinator.subtitleModel.selectedSubtitleInfo = nil
+                                          try? await Task.sleep(nanoseconds: 300_000_000)
+                                          coordinator.subtitleModel.selectedSubtitleInfo = match
+                                      }
                                   }
                               } else if let pick = textJapanese ?? japanese.first {
                                   coordinator.subtitleModel.selectedSubtitleInfo = pick
@@ -6631,9 +6639,13 @@ jobs:
                   .sheet(isPresented: $showMenu) {
                       menuSheet
                   }
-                  .sheet(isPresented: $showLookup) {
-                      WordLookupSheet(text: lookupWord)
+                  .overlay(alignment: .bottom) {
+                      if showLookup {
+                          lookupPanel
+                              .transition(.move(edge: .bottom))
+                      }
                   }
+                  .animation(.easeOut(duration: 0.2), value: showLookup)
                   .onChange(of: showLookup) { shown in
                       if !shown {
                           coordinator.playerLayer?.play()
@@ -7272,6 +7284,31 @@ jobs:
                           .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
                       syncMessage = "В файле не найдено реплик: символов \(raw.count), первая строка: «\(String(firstLine.prefix(40)))»"
                   }
+              }
+
+              /// The dictionary panel: no dimming of the picture, the controls stay visible behind it.
+              private var lookupPanel: some View {
+                  VStack(spacing: 0) {
+                      HStack {
+                          Spacer()
+                          Button {
+                              showLookup = false
+                          } label: {
+                              Image(systemName: "xmark.circle.fill")
+                                  .font(.title2)
+                                  .foregroundColor(.secondary)
+                          }
+                      }
+                      .padding(10)
+                      WordLookupSheet(text: lookupWord)
+                  }
+                  .frame(maxWidth: .infinity)
+                  .frame(height: UIScreen.main.bounds.height * 0.62)
+                  .background(Color.black.opacity(0.15))
+                  .clipShape(RoundedRectangle(cornerRadius: 16))
+                  .padding(.horizontal, 6)
+                  .padding(.bottom, 6)
+                  .frame(maxHeight: .infinity, alignment: .bottom)
               }
 
               private func openLookup() {
@@ -8252,6 +8289,31 @@ jobs:
         run: |
           pnpm generate:release
           pnpm build:ios
+          python3 - <<'HL'
+          import base64, json, pathlib, re
+
+          # runs after `pnpm build:ios` (the web build cleans its output folder): frequency and JLPT tables
+          # are written as binary files next to the web resources, read by the app for the subtitle highlight
+          hl = pathlib.Path("main/res/hl")
+          hl.mkdir(parents=True, exist_ok=True)
+          jl = pathlib.Path("main/src/extension/background/jlptData.ts")
+          if jl.exists():
+              m = re.search(r'export const JLPT_DATA = "([^"]*)"', jl.read_text(encoding="utf-8"))
+              if m and m.group(1):
+                  (hl / "jlpt.bin").write_bytes(base64.b64decode(m.group(1)))
+                  print("jlpt table written")
+          fr = pathlib.Path("main/src/extension/background/frequencyData.ts")
+          if fr.exists():
+              text = fr.read_text(encoding="utf-8")
+              dicts = json.loads(text[text.index("=") + 1:].strip().rstrip(";"))
+              index = []
+              for d in dicts:
+                  name = "freq_" + re.sub(r"[^A-Za-z0-9_-]", "_", d["id"])
+                  (hl / (name + ".bin")).write_bytes(base64.b64decode(d["data"]))
+                  index.append({"id": d["id"], "name": d["name"], "file": name + ".bin"})
+              (hl / "index.json").write_text(json.dumps(index, ensure_ascii=False), encoding="utf-8")
+              print("frequency tables written:", len(index))
+          HL
 
       - name: Make the "Set Build Version" script safe
         working-directory: src
