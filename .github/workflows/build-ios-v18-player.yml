@@ -6065,6 +6065,8 @@ jobs:
               let id: Int
               let text: String
               let start: Int
+              var base: String = ""
+              var reading: String = ""
           }
 
           struct LookupEntry: Identifiable {
@@ -6089,7 +6091,9 @@ jobs:
                   for (i, t) in ((root["tokens"] as? [[String: Any]]) ?? []).enumerated() {
                       tokens.append(LookupToken(id: i,
                                                 text: t["text"] as? String ?? "",
-                                                start: t["start"] as? Int ?? 0))
+                                                start: t["start"] as? Int ?? 0,
+                                                base: t["base"] as? String ?? "",
+                                                reading: t["reading"] as? String ?? ""))
                   }
                   var entries: [LookupEntry] = []
                   for (i, e) in ((root["entries"] as? [[String: Any]]) ?? []).enumerated() where (e["type"] as? String) == "word" {
@@ -6266,11 +6270,196 @@ jobs:
               }
           }
 
+          /// Frequency and JLPT tables of the web app (res/hl), read with the same hash and search as the web highlight.
+          @available(iOS 16.0, *)
+          enum HighlightData {
+              struct Settings {
+                  var enabled = false
+                  var freq = true
+                  var dict = "main"
+                  var lo = 3000
+                  var hi = 8000
+                  var color = "#ff9f0a"
+                  var jlpt: [Int: Bool] = [:]
+
+                  /// the same settings as the web highlight, from the shared config
+                  static func load() -> Settings {
+                      var s = Settings()
+                      guard let json = (try? Storage.config.get())?.data(using: .utf8),
+                            let root = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any] else { return s }
+                      s.enabled = root["highlight.enabled"] as? Bool ?? false
+                      s.freq = root["highlight.freq"] as? Bool ?? true
+                      s.dict = root["highlight.dict"] as? String ?? "main"
+                      let a = (root["highlight.min"] as? NSNumber)?.intValue ?? 3000
+                      let b = (root["highlight.max"] as? NSNumber)?.intValue ?? 8000
+                      s.lo = max(1, min(a, b))
+                      s.hi = max(a, b)
+                      s.color = root["highlight.color"] as? String ?? "#ff9f0a"
+                      for n in 1...5 {
+                          s.jlpt[n] = root["highlight.jlpt.n\(n)"] as? Bool ?? false
+                      }
+                      return s
+                  }
+              }
+
+              static let jlptColors: [Int: String] = [5: "#34c759", 4: "#0a84ff", 3: "#d9a400", 2: "#ff9500", 1: "#ff3b30"]
+
+              private static var jlptCache: [UInt32]?
+              private static var freqCache: [(id: String, name: String, table: [UInt32])]?
+
+              private static func resource(_ name: String, _ ext: String) -> URL? {
+                  Bundle.main.url(forResource: name, withExtension: ext, subdirectory: "res/hl")
+              }
+
+              /// little-endian 32-bit numbers of a table file
+              private static func words(_ url: URL) -> [UInt32]? {
+                  guard let data = try? Data(contentsOf: url) else { return nil }
+                  var out: [UInt32] = []
+                  out.reserveCapacity(data.count / 4)
+                  var i = 0
+                  while i + 3 < data.count {
+                      out.append(UInt32(data[i]) | UInt32(data[i + 1]) << 8 | UInt32(data[i + 2]) << 16 | UInt32(data[i + 3]) << 24)
+                      i += 4
+                  }
+                  return out
+              }
+
+              private static func jlptTable() -> [UInt32]? {
+                  if jlptCache == nil, let url = resource("jlpt", "bin") {
+                      jlptCache = words(url)
+                  }
+                  return jlptCache
+              }
+
+              private static func freqTables() -> [(id: String, name: String, table: [UInt32])] {
+                  if let cached = freqCache { return cached }
+                  var loaded: [(id: String, name: String, table: [UInt32])] = []
+                  if let url = resource("index", "json"), let data = try? Data(contentsOf: url),
+                     let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] {
+                      for entry in list {
+                          guard let file = entry["file"], let id = entry["id"], let name = entry["name"],
+                                let fileURL = Bundle.main.url(forResource: (file as NSString).deletingPathExtension,
+                                                              withExtension: "bin", subdirectory: "res/hl"),
+                                let table = words(fileURL) else { continue }
+                          loaded.append((id: id, name: name, table: table))
+                      }
+                  }
+                  freqCache = loaded
+                  return loaded
+              }
+
+              /// FNV-1a over UTF-16 units, the same as charCodeAt in the web code
+              static func hash(_ s: String) -> UInt32 {
+                  var h: UInt32 = 0x811C9DC5
+                  for unit in s.utf16 {
+                      h ^= UInt32(unit)
+                      h = h &* 0x01000193
+                  }
+                  return h
+              }
+
+              /// Position of the record with this key; records are `width` numbers, sorted by key.
+              private static func find(_ t: [UInt32], width: Int, _ key: UInt32) -> Int? {
+                  var lo = 0
+                  var hi = t.count / width - 1
+                  while lo <= hi {
+                      let mid = (lo + hi) / 2
+                      let k = t[mid * width]
+                      if k == key { return mid * width }
+                      if k < key { lo = mid + 1 } else { hi = mid - 1 }
+                  }
+                  return nil
+              }
+
+              static func hiragana(_ s: String) -> String {
+                  var out = String.UnicodeScalarView()
+                  for sc in s.unicodeScalars {
+                      if (0x30A1...0x30F6).contains(sc.value), let h = Unicode.Scalar(sc.value - 0x60) {
+                          out.append(h)
+                      } else {
+                          out.append(sc)
+                      }
+                  }
+                  return String(out)
+              }
+
+              static func jlptLevel(base: String, reading: String) -> Int {
+                  guard let t = jlptTable(),
+                        let i = find(t, width: 2, hash(base + "|" + reading)) ?? find(t, width: 2, hash(base)) else { return 0 }
+                  return Int(t[i + 1])
+              }
+
+              /// Rank in one frequency list, chosen the way the web does it (kana rank for kana-only words).
+              static func rank(base: String, reading: String, dict: String) -> Int? {
+                  let tables = freqTables()
+                  let isWebNovel = { (name: String) in name.range(of: "webnovel", options: .caseInsensitive) != nil }
+                  var index = tables.firstIndex { $0.id == dict } ?? -1
+                  if index < 0 {
+                      index = dict == "wn"
+                          ? (tables.firstIndex { isWebNovel($0.name) } ?? -1)
+                          : (tables.firstIndex { !isWebNovel($0.name) } ?? -1)
+                  }
+                  guard index >= 0 else { return nil }
+                  let t = tables[index].table
+                  guard let i = find(t, width: 3, hash(base + "|" + reading)) ?? find(t, width: 3, hash(base)) else { return nil }
+                  let kanji = Int(t[i + 1])
+                  let kana = Int(t[i + 2])
+                  let kanaOnly = base.unicodeScalars.allSatisfy { (0x3040...0x30FF).contains($0.value) }
+                  let value = kanaOnly ? (kana > 0 ? kana : kanji) : (kanji > 0 ? kanji : kana)
+                  return value > 0 ? value : nil
+              }
+
+              static func color(hex: String) -> Color? {
+                  var h = hex.trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+                  if h.count == 3 {
+                      h = h.map { "\($0)\($0)" }.joined()
+                  }
+                  guard h.count == 6, let v = UInt32(h, radix: 16) else { return nil }
+                  return Color(red: Double((v >> 16) & 0xFF) / 255,
+                               green: Double((v >> 8) & 0xFF) / 255,
+                               blue: Double(v & 0xFF) / 255)
+              }
+
+              /// Dictionary forms of the words added to Anki: the same list the extension reads (stats.v1).
+              static func minedWords() -> Set<String> {
+                  guard let json = (try? Storage.stats.get())?.data(using: .utf8),
+                        let root = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any],
+                        let days = root["days"] as? [String: Any] else { return [] }
+                  var words = Set<String>()
+                  for case let day as [String: Any] in days.values {
+                      for word in (day["mined"] as? [String]) ?? [] {
+                          words.insert(word)
+                      }
+                  }
+                  return words
+              }
+
+              /// Color of each word: the JLPT level color first, then the frequency color; the same rules as in Safari.
+              static func colors(for tokens: [LookupToken]) -> [Int: Color] {
+                  let settings = Settings.load()
+                  guard settings.enabled else { return [:] }
+                  var result: [Int: Color] = [:]
+                  let mined = minedWords()
+                  for token in tokens where !token.base.isEmpty && !mined.contains(token.base) {
+                      let reading = hiragana(token.reading)
+                      let level = jlptLevel(base: token.base, reading: reading)
+                      if level > 0, settings.jlpt[level] == true, let hex = jlptColors[level], let c = color(hex: hex) {
+                          result[token.id] = c
+                      } else if settings.freq, let r = rank(base: token.base, reading: reading, dict: settings.dict),
+                                r >= settings.lo, r <= settings.hi, let c = color(hex: settings.color) {
+                          result[token.id] = c
+                      }
+                  }
+                  return result
+              }
+          }
+
           @available(iOS 16.0, *)
           struct SubtitleLookupBar: View {
               let line: String
               let onTap: (LookupToken) -> Void
               @State private var tokens: [LookupToken] = []
+              @State private var tokenColors: [Int: Color] = [:]
 
               var body: some View {
                   Group {
@@ -6285,7 +6474,7 @@ jobs:
                               ForEach(tokens) { token in
                                   Text(token.text)
                                       .font(.system(size: 22, weight: .medium))
-                                      .foregroundColor(.white)
+                                      .foregroundColor(tokenColors[token.id] ?? .white)
                                       .padding(.vertical, 4)
                                       .padding(.horizontal, 2)
                                       .contentShape(Rectangle())
@@ -6300,10 +6489,14 @@ jobs:
                   .background(Color.black.opacity(0.55))
                   .cornerRadius(10)
                   .padding(.horizontal, 8)
-                  .onAppear { tokens = NativeLookup.tokenize(line, charAt: 0).tokens }
-                  .onChange(of: line) { newValue in
-                      tokens = NativeLookup.tokenize(newValue, charAt: 0).tokens
-                  }
+                  .onAppear { refresh(line) }
+                  .onChange(of: line) { newValue in refresh(newValue) }
+              }
+
+              private func refresh(_ text: String) {
+                  let result = NativeLookup.tokenize(text, charAt: 0).tokens
+                  tokens = result
+                  tokenColors = HighlightData.colors(for: result)
               }
           }
 
@@ -6389,6 +6582,7 @@ jobs:
               private var delayKey: String { "subdelay." + url.lastPathComponent }
               private var subChoiceKey: String { "subchoice." + url.lastPathComponent }
               @State private var resumeHandled = false
+              @AppStorage("sheetOpacity") private var sheetOpacity: Double = 1.0
               @State private var lastSavedPosition: Double = -1
 
               var body: some View {
@@ -6637,6 +6831,14 @@ jobs:
                                   }
                               }
                           }
+                          Section("Окна словаря") {
+                              HStack {
+                                  Text("Прозрачность")
+                                  Spacer()
+                                  Text("\(Int(sheetOpacity * 100))%").foregroundColor(.secondary)
+                              }
+                              Slider(value: $sheetOpacity, in: 0.3...1.0, step: 0.05)
+                          }
                           Section("Субтитры") {
                               Button("Добавить свои субтитры") { showImporter = true }
                               delayRow
@@ -6749,6 +6951,7 @@ jobs:
 
               private func chooseExternal(_ file: URL) {
                   activeExternal = file
+                  UserDefaults.standard.set("file:" + file.lastPathComponent, forKey: subChoiceKey)
                   externalCues = EmbeddedSubtitles.cues(fromFile: file)
                   usingExternal = !externalCues.isEmpty
                   coordinator.subtitleModel.selectedSubtitleInfo = nil
@@ -6958,10 +7161,29 @@ jobs:
                   let skipped = await Task.detached(priority: .utility) {
                       EmbeddedSubtitles.nonDialogueStreams(url: videoURL)
                   }.value
+                  // every subtitle file that belongs to this video (name.srt, name.ass, name.ja.srt ...) is listed
+                  let base = url.deletingPathExtension().lastPathComponent
+                  let folder = url.deletingLastPathComponent()
+                  let found = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+                      .filter { $0.lastPathComponent.hasPrefix(base + ".")
+                          && ["srt", "ass", "ssa", "vtt"].contains($0.pathExtension.lowercased()) }
+                  for file in found where !externalURLs.contains(file) {
+                      externalURLs.append(file)
+                  }
+                  // the last choice comes back: an added file, or an embedded track ("" means no subtitles)
+                  let savedChoice = UserDefaults.standard.string(forKey: subChoiceKey)
+                  var restoredFile = false
+                  if let savedChoice, savedChoice.hasPrefix("file:") {
+                      let file = folder.appendingPathComponent(String(savedChoice.dropFirst(5)))
+                      if FileManager.default.fileExists(atPath: file.path) {
+                          chooseExternal(file)
+                          restoredFile = true
+                      }
+                  }
                   await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator,
-                                                             pickSubtitle: !hasExternal,
+                                                             pickSubtitle: !hasExternal && !restoredFile,
                                                              excluded: skipped,
-                                                             savedChoice: UserDefaults.standard.string(forKey: subChoiceKey))
+                                                             savedChoice: restoredFile ? nil : savedChoice)
               }
 
               private func generatedSubtitleURL() -> URL? {
@@ -7369,21 +7591,24 @@ jobs:
               /// Start times of the subtitle track used as the timing reference for auto-sync.
               static func referenceStarts(url: URL) -> [Double] {
                   let japanese = ["jpn", "ja", "jap"]
-                  let streams = subtitleStreams(url: url)
-                  // Japanese first: the generated .ja.srt comes from the Japanese picture track
-                  if let text = streams.first(where: { $0.isText && japanese.contains($0.language) }) {
-                      return (extract(url: url, streamIndex: text.index) ?? []).map { $0.start }
+                  let all = subtitleStreams(url: url)
+                  let skipped = nonDialogueStreams(url: url)
+                  let candidates = all.filter { !skipped.contains($0.index) }
+                  // the dialogue track has the most lines: signs and songs tracks are much shorter
+                  var best: [Double] = []
+                  var bestScore = -1.0
+                  for stream in (candidates.isEmpty ? all : candidates) {
+                      let starts = stream.isText
+                          ? (extract(url: url, streamIndex: stream.index) ?? []).map { $0.start }
+                          : packetStarts(url: url, streamIndex: stream.index)
+                      // a small preference for Japanese when two tracks are about the same length
+                      let score = Double(starts.count) * (japanese.contains(stream.language) ? 1.05 : 1.0)
+                      if score > bestScore {
+                          bestScore = score
+                          best = starts
+                      }
                   }
-                  if let picture = streams.first(where: { !$0.isText && japanese.contains($0.language) }) {
-                      return packetStarts(url: url, streamIndex: picture.index)
-                  }
-                  if let text = streams.first(where: { $0.isText }) {
-                      return (extract(url: url, streamIndex: text.index) ?? []).map { $0.start }
-                  }
-                  if let picture = streams.first {
-                      return packetStarts(url: url, streamIndex: picture.index)
-                  }
-                  return []
+                  return best
               }
 
               /// Packet times of one track: no decoding, so it is fast even for picture tracks.
@@ -7596,6 +7821,18 @@ jobs:
           @available(iOS 16.0, *)
           struct WordLookupSheet: View {
               let text: String
+              @AppStorage("sheetOpacity") private var sheetOpacity: Double = 1.0
+
+              /// the sheet itself is clear on iOS 16.4+, so the chosen opacity shows the video behind
+              private struct SheetTransparency: ViewModifier {
+                  func body(content: Content) -> some View {
+                      if #available(iOS 16.4, *) {
+                          content.presentationBackground(.clear)
+                      } else {
+                          content
+                      }
+                  }
+              }
 
               private var pageURL: URL? {
                   let page = Bundle.main.url(forResource: "dictionary", withExtension: "html", subdirectory: "res")
@@ -7757,6 +7994,8 @@ jobs:
                       store.status[name] = text
                       store.reload()
                   }
+                  .opacity(sheetOpacity)
+                  .modifier(SheetTransparency())
               }
           }
 
@@ -7975,6 +8214,37 @@ jobs:
               print("journal: timestamp formatter is shared")
           else:
               print("journal: not in this build, skipped")
+          PY
+
+      - name: Highlight descriptions - shorter
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+
+          # Shorter descriptions of the highlight settings (the text is only replaced where it is found)
+          p = pathlib.Path("src/main/src/components/options/groups/GroupHighlight.svelte")
+          if not p.exists():
+              print("highlight descriptions: file not in this build, skipped")
+          else:
+              t = p.read_text(encoding="utf-8")
+              replacements = [
+                  (r'(<OptionToggle bind:value=\{\$enabledConfig\} title="Подсвечивать слова">\n    )([\s\S]*?)(\n  </OptionToggle>)',
+                   'Выделяет слова, которых ещё нет в Anki. После изменения обновите страницу.'),
+                  (r'(<OptionToggle bind:value=\{\$freqConfig\} title="Подсвечивать по частотности">\n    )([\s\S]*?)(\n  </OptionToggle>)',
+                   'Выделяет слова по частотности: 1 — самое частое слово, чем больше число, тем реже слово.'),
+                  (r'(<OptionNumber bind:value=\{\$minConfig\} title="От места"[^>]*>\n    )([\s\S]*?)(\n  </OptionNumber>)',
+                   'Слова чаще этого места не выделяются: их вы, скорее всего, знаете.'),
+                  (r'(<OptionNumber bind:value=\{\$maxConfig\} title="До места"[^>]*>\n    )([\s\S]*?)(\n  </OptionNumber>)',
+                   'Слова реже этого места не выделяются.'),
+                  (r'(<div class="note">\n    )(Отметьте уровни[\s\S]*?)(\n  </div>)',
+                   'Уровни JLPT, которые нужно выделять. Цвет уровня важнее цвета частотности. Списки составило сообщество.'),
+              ]
+              done = 0
+              for pattern, new in replacements:
+                  t, n = re.subn(pattern, lambda m, new=new: m.group(1) + new + m.group(3), t, count=1)
+                  done += n
+              p.write_text(t, encoding="utf-8")
+              print(f"highlight descriptions: {done} of {len(replacements)} replaced")
           PY
 
       - name: Pre-generate files that Xcode expects to already exist
