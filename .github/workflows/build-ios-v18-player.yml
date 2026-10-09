@@ -5949,7 +5949,7 @@ jobs:
               /// Text Japanese subtitles win over bitmap ones (bitmap subtitles cannot be looked up).
               @MainActor
               static func autoSelectJapanese(coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool,
-                                             excluded: Set<Int> = []) async {
+                                             excluded: Set<Int> = [], savedChoice: String? = nil) async {
                   guard prefersJapanese else { return }
                   var audioDone = false
                   var subtitleDone = !pickSubtitle
@@ -5979,7 +5979,12 @@ jobs:
                                   guard let track = info as? FFmpegAssetTrack else { return false }
                                   return !track.isImageSubtitle
                               }
-                              if let pick = textJapanese ?? japanese.first {
+                              if let saved = savedChoice {
+                                  // the choice of the last session wins; "" means no subtitles
+                                  if let match = infos.first(where: { $0.subtitleID == saved }) {
+                                      coordinator.subtitleModel.selectedSubtitleInfo = match
+                                  }
+                              } else if let pick = textJapanese ?? japanese.first {
                                   coordinator.subtitleModel.selectedSubtitleInfo = pick
                                   // a track chosen at load time is often not attached yet: once playback runs,
                                   // select it again, the same as switching tracks by hand (unless the user changed it)
@@ -6027,6 +6032,33 @@ jobs:
           struct PicturePart {
               let image: UIImage
               let origin: CGPoint
+          }
+
+          /// Where a video was stopped and whether it was watched to the end (kept per file name).
+          enum VideoProgress {
+              static func position(_ name: String) -> Double {
+                  UserDefaults.standard.double(forKey: "resume." + name)
+              }
+
+              static func save(_ name: String, position: Double, duration: Double) {
+                  guard duration > 0 else { return }
+                  UserDefaults.standard.set(position, forKey: "resume." + name)
+                  if position >= duration * 0.92 {
+                      UserDefaults.standard.set(true, forKey: "watched." + name)
+                  }
+              }
+
+              static func isWatched(_ name: String) -> Bool {
+                  UserDefaults.standard.bool(forKey: "watched." + name)
+              }
+
+              static func clockText(_ seconds: Double) -> String {
+                  let total = Int(max(0, seconds))
+                  let h = total / 3600
+                  let m = (total % 3600) / 60
+                  let sec = total % 60
+                  return h > 0 ? String(format: "%d:%02d:%02d", h, m, sec) : String(format: "%d:%02d", m, sec)
+              }
           }
 
           struct LookupToken: Identifiable {
@@ -6191,6 +6223,49 @@ jobs:
               }
           }
 
+          /// Lays its items out in rows and wraps to the next row when they do not fit.
+          @available(iOS 16.0, *)
+          struct FlowLayout: Layout {
+              var spacing: CGFloat = 0
+
+              func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+                  let maxWidth = proposal.width ?? .infinity
+                  var x: CGFloat = 0
+                  var y: CGFloat = 0
+                  var rowHeight: CGFloat = 0
+                  var widest: CGFloat = 0
+                  for view in subviews {
+                      let size = view.sizeThatFits(.unspecified)
+                      if x > 0 && x + size.width > maxWidth {
+                          x = 0
+                          y += rowHeight + spacing
+                          rowHeight = 0
+                      }
+                      x += size.width + spacing
+                      rowHeight = max(rowHeight, size.height)
+                      widest = max(widest, x - spacing)
+                  }
+                  return CGSize(width: min(widest, maxWidth), height: y + rowHeight)
+              }
+
+              func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+                  var x = bounds.minX
+                  var y = bounds.minY
+                  var rowHeight: CGFloat = 0
+                  for view in subviews {
+                      let size = view.sizeThatFits(.unspecified)
+                      if x > bounds.minX && x + size.width > bounds.maxX {
+                          x = bounds.minX
+                          y += rowHeight + spacing
+                          rowHeight = 0
+                      }
+                      view.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
+                      x += size.width + spacing
+                      rowHeight = max(rowHeight, size.height)
+                  }
+              }
+          }
+
           @available(iOS 16.0, *)
           struct SubtitleLookupBar: View {
               let line: String
@@ -6198,14 +6273,15 @@ jobs:
               @State private var tokens: [LookupToken] = []
 
               var body: some View {
-                  ScrollView(.horizontal, showsIndicators: false) {
-                      HStack(spacing: 0) {
-                          if tokens.isEmpty {
-                              // no words could be split: still show the line so it is visible what KSPlayer gives us
-                              Text(line)
-                                  .font(.system(size: 22, weight: .medium))
-                                  .foregroundColor(.white)
-                          } else {
+                  Group {
+                      if tokens.isEmpty {
+                          // no words could be split: the line itself is shown
+                          Text(line)
+                              .font(.system(size: 22, weight: .medium))
+                              .foregroundColor(.white)
+                              .multilineTextAlignment(.center)
+                      } else {
+                          FlowLayout(spacing: 0) {
                               ForEach(tokens) { token in
                                   Text(token.text)
                                       .font(.system(size: 22, weight: .medium))
@@ -6217,8 +6293,10 @@ jobs:
                               }
                           }
                       }
-                      .padding(.horizontal, 12)
                   }
+                  .frame(maxWidth: .infinity)
+                  .padding(.horizontal, 12)
+                  .padding(.vertical, 6)
                   .background(Color.black.opacity(0.55))
                   .cornerRadius(10)
                   .padding(.horizontal, 8)
@@ -6309,6 +6387,9 @@ jobs:
               @State private var lookupWord = ""
 
               private var delayKey: String { "subdelay." + url.lastPathComponent }
+              private var subChoiceKey: String { "subchoice." + url.lastPathComponent }
+              @State private var resumeHandled = false
+              @State private var lastSavedPosition: Double = -1
 
               var body: some View {
                   // the engine must be chosen before the player layer is created
@@ -6324,7 +6405,7 @@ jobs:
                                   .contentShape(Rectangle())
                                   .onTapGesture { toggleControls() }
                               pictureLayer(rect)
-                              subtitleLayer(rect)
+                              subtitleLayer(rect, portrait: geo.size.height > geo.size.width)
                           }
                           .frame(width: geo.size.width, height: geo.size.height)
                       }
@@ -6336,6 +6417,11 @@ jobs:
                   }
                   .toolbar(.hidden, for: .tabBar)
                   .navigationBarHidden(true)
+                  .onDisappear {
+                      if resumeHandled {
+                          VideoProgress.save(url.lastPathComponent, position: position, duration: duration)
+                      }
+                  }
                   .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
                       tick()
                   }
@@ -6382,16 +6468,32 @@ jobs:
                   .allowsHitTesting(false)
               }
 
-              private func subtitleLayer(_ rect: CGRect) -> some View {
-                  VStack(spacing: 6) {
-                      Spacer()
-                      if !line.isEmpty {
-                          SubtitleLookupBar(line: line, onTap: { _ in openLookup() })
+              private func subtitleLayer(_ rect: CGRect, portrait: Bool) -> some View {
+                  Group {
+                      if portrait {
+                          // portrait: the lines go under the picture, across the width of the video
+                          VStack(spacing: 6) {
+                              if !line.isEmpty {
+                                  SubtitleLookupBar(line: line, onTap: { _ in openLookup() })
+                              }
+                              Spacer(minLength: 0)
+                          }
+                          .frame(width: rect.width, alignment: .top)
+                          .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                          .padding(.leading, rect.minX)
+                          .padding(.top, rect.maxY + 10)
+                      } else {
+                          VStack(spacing: 6) {
+                              Spacer()
+                              if !line.isEmpty {
+                                  SubtitleLookupBar(line: line, onTap: { _ in openLookup() })
+                              }
+                          }
+                          .padding(.bottom, 26)
+                          .frame(width: rect.width, height: rect.height, alignment: .bottom)
+                          .position(x: rect.midX, y: rect.midY)
                       }
                   }
-                  .padding(.bottom, 26)
-                  .frame(width: rect.width, height: rect.height, alignment: .bottom)
-                  .position(x: rect.midX, y: rect.midY)
               }
 
               private var controlsLayer: some View {
@@ -6630,6 +6732,7 @@ jobs:
               }
 
               private func chooseNone() {
+                  UserDefaults.standard.set("", forKey: subChoiceKey)
                   usingExternal = false
                   activeExternal = nil
                   coordinator.subtitleModel.selectedSubtitleInfo = nil
@@ -6637,6 +6740,7 @@ jobs:
               }
 
               private func chooseEmbedded(_ track: FFmpegAssetTrack) {
+                  UserDefaults.standard.set(track.subtitleID, forKey: subChoiceKey)
                   usingExternal = false
                   activeExternal = nil
                   coordinator.subtitleModel.selectedSubtitleInfo = track
@@ -6718,6 +6822,18 @@ jobs:
                       }
                       if player.duration > 0, player.duration != duration {
                           duration = player.duration
+                      }
+                      if !resumeHandled, duration > 0 {
+                          // start where the video was stopped last time
+                          resumeHandled = true
+                          let saved = VideoProgress.position(url.lastPathComponent)
+                          if saved > 10, saved < duration - 30 {
+                              seek(to: saved)
+                          }
+                      }
+                      if resumeHandled, duration > 0, abs(position - lastSavedPosition) >= 5 {
+                          lastSavedPosition = position
+                          VideoProgress.save(url.lastPathComponent, position: position, duration: duration)
                       }
                       let size = player.naturalSize
                       if size.width > 0, size.height > 0, size != videoSize {
@@ -6844,7 +6960,8 @@ jobs:
                   }.value
                   await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator,
                                                              pickSubtitle: !hasExternal,
-                                                             excluded: skipped)
+                                                             excluded: skipped,
+                                                             savedChoice: UserDefaults.standard.string(forKey: subChoiceKey))
               }
 
               private func generatedSubtitleURL() -> URL? {
@@ -7189,20 +7306,10 @@ jobs:
                   return context.makeImage()
               }
 
-              /// Japanese text of one picture. Vision reads horizontal lines: a tall picture (vertical text) is also
-              /// read turned 90 degrees both ways, and the reading with more characters wins.
+              /// Japanese text of one picture: horizontal lines (vertical text is not read).
               /// The fast mode uses the same recognizer: Vision's fast recognizer does not handle Japanese.
               private static func readJapanese(_ image: CGImage) -> String {
-                  var best = recognize(image, orientation: .up)
-                  if image.height > image.width {
-                      for orientation in [CGImagePropertyOrientation.right, CGImagePropertyOrientation.left] {
-                          let candidate = recognize(image, orientation: orientation)
-                          if candidate.count > best.count {
-                              best = candidate
-                          }
-                      }
-                  }
-                  return best
+                  recognize(image, orientation: .up)
               }
 
               private static func recognize(_ image: CGImage, orientation: CGImagePropertyOrientation) -> String {
@@ -7516,11 +7623,18 @@ jobs:
               }
           }
 
-          /// Video library: import, the background subtitle job of each video, and per-file progress.
+          /// One folder of the video library: its files and folders, import, and the background subtitle job.
           @available(iOS 16.0, *)
           @MainActor
           final class VideoLibraryStore: ObservableObject {
-              @Published var names: [String] = []
+              struct Item: Identifiable {
+                  let url: URL
+                  let isFolder: Bool
+                  var id: String { url.path }
+              }
+
+              let folder: URL
+              @Published var items: [Item] = []
               @Published var progress: [String: Double] = [:]
               @Published var status: [String: String] = [:]
               /// Video waiting for the user's choice of recognition mode.
@@ -7532,8 +7646,31 @@ jobs:
                   videoExtensions.contains((name as NSString).pathExtension.lowercased())
               }
 
+              init(folder: URL) {
+                  self.folder = folder
+              }
+
               func reload() {
-                  names = YomikiriVideoLibrary.fileNames()
+                  let urls = (try? FileManager.default.contentsOfDirectory(
+                      at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? []
+                  items = urls.map { url -> Item in
+                      let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                      return Item(url: url, isFolder: isDir)
+                  }
+                  .sorted { a, b in
+                      if a.isFolder != b.isFolder {
+                          return a.isFolder
+                      }
+                      return a.url.lastPathComponent.localizedStandardCompare(b.url.lastPathComponent) == .orderedAscending
+                  }
+              }
+
+              func createFolder(named name: String) {
+                  let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !clean.isEmpty else { return }
+                  let dir = folder.appendingPathComponent(clean, isDirectory: true)
+                  try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                  reload()
               }
 
               func importVideo(_ src: URL) {
@@ -7541,10 +7678,9 @@ jobs:
                   defer {
                       if access { src.stopAccessingSecurityScopedResource() }
                   }
-                  guard let dir = YomikiriMediaSchemeHandler.videosDirectory() else { return }
-                  var dest = dir.appendingPathComponent(src.lastPathComponent)
+                  var dest = folder.appendingPathComponent(src.lastPathComponent)
                   if FileManager.default.fileExists(atPath: dest.path) {
-                      dest = dir.appendingPathComponent(String(UUID().uuidString.prefix(6)) + "_" + src.lastPathComponent)
+                      dest = folder.appendingPathComponent(String(UUID().uuidString.prefix(6)) + "_" + src.lastPathComponent)
                   }
                   do {
                       try FileManager.default.copyItem(at: src, to: dest)
@@ -7585,8 +7721,8 @@ jobs:
                   convertSubtitles(video, accurate: accurate)
               }
 
-              /// Background job for one video: reads its Japanese text track and writes it as SRT next to the video.
-              /// Picture tracks are reported, not converted yet.
+              /// Background job for one video: reads its Japanese text track, or reads its Japanese pictures,
+              /// and writes the result as SRT next to the video.
               func convertSubtitles(_ video: URL, accurate: Bool) {
                   let name = video.lastPathComponent
                   status[name] = "ищу японские субтитры…"
@@ -7624,28 +7760,45 @@ jobs:
               }
           }
 
+          /// The video list of one folder. The root is the Videos folder; folders open their own list.
           @available(iOS 16.0, *)
           struct NativeVideoListView: View {
-              @StateObject private var library = VideoLibraryStore()
+              let title: String
+              @StateObject private var library: VideoLibraryStore
               @State private var showImporter = false
+              @State private var showNewFolder = false
+              @State private var newFolderName = ""
+
+              init(folder: URL? = nil, title: String = "Видео") {
+                  let dir = folder ?? YomikiriMediaSchemeHandler.videosDirectory() ?? FileManager.default.temporaryDirectory
+                  _library = StateObject(wrappedValue: VideoLibraryStore(folder: dir))
+                  self.title = title
+              }
 
               var body: some View {
                   List {
-                      if library.names.isEmpty {
-                          Text("Видео пока нет. Нажмите «+» и выберите файл.")
+                      if library.items.isEmpty {
+                          Text("Пусто. Нажмите «+», чтобы добавить видео.")
                               .foregroundColor(.secondary)
                       }
-                      ForEach(library.names, id: \.self) { name in
-                          fileRow(name)
+                      ForEach(library.items) { item in
+                          row(item)
                       }
                   }
-                  .navigationTitle("Видео")
+                  .navigationTitle(title)
                   .toolbar {
                       ToolbarItem(placement: .navigationBarTrailing) {
                           Button {
                               showImporter = true
                           } label: {
                               Image(systemName: "plus")
+                          }
+                      }
+                      ToolbarItem(placement: .navigationBarTrailing) {
+                          Button {
+                              showNewFolder = true
+                          } label: {
+                              Image(systemName: "folder.badge.plus")
                           }
                       }
                   }
@@ -7656,6 +7809,16 @@ jobs:
                       }, onCancel: {
                           showImporter = false
                       })
+                  }
+                  .alert("Новая папка", isPresented: $showNewFolder) {
+                      TextField("Название", text: $newFolderName)
+                      Button("Создать") {
+                          library.createFolder(named: newFolderName)
+                          newFolderName = ""
+                      }
+                      Button("Отмена", role: .cancel) {
+                          newFolderName = ""
+                      }
                   }
                   .confirmationDialog("Японские субтитры-картинки",
                                       isPresented: Binding(get: { library.pendingChoice != nil },
@@ -7673,23 +7836,40 @@ jobs:
               }
 
               @ViewBuilder
-              private func fileRow(_ name: String) -> some View {
+              private func row(_ item: VideoLibraryStore.Item) -> some View {
+                  if item.isFolder {
+                      NavigationLink(destination: NativeVideoListView(folder: item.url, title: item.url.lastPathComponent)) {
+                          label(item)
+                      }
+                  } else if VideoLibraryStore.isVideo(item.url.lastPathComponent) {
+                      NavigationLink(destination: NativeVideoPlayerScreen(url: item.url)) {
+                          label(item)
+                      }
+                  } else {
+                      label(item)
+                  }
+              }
+
+              private func label(_ item: VideoLibraryStore.Item) -> some View {
+                  let name = item.url.lastPathComponent
                   let ext = (name as NSString).pathExtension.uppercased()
-                  let row = HStack(spacing: 12) {
-                      Image(systemName: symbol(for: name))
+                  return HStack(spacing: 12) {
+                      Image(systemName: item.isFolder ? "folder" : symbol(for: name))
                           .font(.title2)
                           .foregroundColor(.accentColor)
                           .frame(width: 32)
                       VStack(alignment: .leading, spacing: 4) {
                           Text(name).lineLimit(1)
                           HStack(spacing: 8) {
-                              Text(ext.isEmpty ? "—" : ext)
-                                  .font(.caption2.bold())
-                                  .padding(.horizontal, 6)
-                                  .padding(.vertical, 2)
-                                  .background(Color.secondary.opacity(0.2))
-                                  .cornerRadius(4)
-                              if let text = library.status[name] {
+                              if !item.isFolder {
+                                  Text(ext.isEmpty ? "—" : ext)
+                                      .font(.caption2.bold())
+                                      .padding(.horizontal, 6)
+                                      .padding(.vertical, 2)
+                                      .background(Color.secondary.opacity(0.2))
+                                      .cornerRadius(4)
+                              }
+                              if let text = library.status[name] ?? watchText(name, isFolder: item.isFolder) {
                                   Text(text).font(.caption).foregroundColor(.secondary).lineLimit(1)
                               }
                           }
@@ -7698,13 +7878,15 @@ jobs:
                           }
                       }
                   }
-                  if VideoLibraryStore.isVideo(name) {
-                      NavigationLink(destination: NativeVideoPlayerScreen(url: NativeVideoEngine.fileURL(name))) {
-                          row
-                      }
-                  } else {
-                      row
+              }
+
+              private func watchText(_ name: String, isFolder: Bool) -> String? {
+                  guard !isFolder, VideoLibraryStore.isVideo(name) else { return nil }
+                  if VideoProgress.isWatched(name) {
+                      return "просмотрено"
                   }
+                  let position = VideoProgress.position(name)
+                  return position > 10 ? "остановлено на \(VideoProgress.clockText(position))" : nil
               }
 
               private func symbol(for name: String) -> String {
