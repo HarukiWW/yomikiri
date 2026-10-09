@@ -6565,12 +6565,13 @@ jobs:
               }
 
               private var delayRow: some View {
-                  HStack(spacing: 8) {
+                  HStack(spacing: 6) {
                       delayButton("−0.5") { shiftDelay(-0.5) }
                       delayButton("−0.1") { shiftDelay(-0.1) }
                       Text(String(format: "%+.2f с", subDelay))
-                          .font(.body.monospacedDigit())
+                          .font(.callout.monospacedDigit())
                           .lineLimit(1)
+                          .fixedSize()
                           .frame(maxWidth: .infinity)
                       delayButton("+0.1") { shiftDelay(0.1) }
                       delayButton("+0.5") { shiftDelay(0.5) }
@@ -6581,6 +6582,7 @@ jobs:
               private func delayButton(_ title: String, _ action: @escaping () -> Void) -> some View {
                   Button(title, action: action)
                       .buttonStyle(.bordered)
+                      .controlSize(.small)
                       .lineLimit(1)
                       .fixedSize()
               }
@@ -7063,7 +7065,7 @@ jobs:
 
               /// Picture subtitles (PGS): every display set is decoded with libavcodec, each picture is upscaled
               /// and read with Vision (Japanese). Cues get their times from the packets and the display times.
-              static func pictureCues(url: URL, streamIndex index: Int,
+              static func pictureCues(url: URL, streamIndex index: Int, accurate: Bool = true,
                                       progress: ((Double) -> Void)? = nil) -> [Cue] {
                   var opened: UnsafeMutablePointer<AVFormatContext>? = nil
                   guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return [] }
@@ -7112,8 +7114,10 @@ jobs:
                       guard pts != Int64.min else { continue }
                       let base = Double(pts) * timeBase
                       let start = base + Double(sub.start_display_time) / 1000
-                      let end = base + Double(sub.end_display_time) / 1000
-                      let text = recognizeRects(sub)
+                      // 0xFFFFFFFF (or 0) means "no end given": the end becomes the next display set's start below
+                      let hasEnd = sub.end_display_time != UInt32.max && sub.end_display_time > 0
+                      let end = hasEnd ? base + Double(sub.end_display_time) / 1000 : start
+                      let text = recognizeRects(sub, accurate: accurate)
                       if !text.isEmpty {
                           cues.append(Cue(start: start, end: end, text: text))
                       }
@@ -7123,16 +7127,25 @@ jobs:
                       let next = i + 1 < cues.count ? cues[i + 1].start : cues[i].start + 3
                       cues[i] = Cue(start: cues[i].start, end: next, text: cues[i].text)
                   }
-                  return cues.sorted { $0.start < $1.start }
+                  // the same text shown again and again (e.g. a music note) becomes one cue
+                  var merged: [Cue] = []
+                  for cue in cues.sorted(by: { $0.start < $1.start }) {
+                      if let last = merged.last, last.text == cue.text, cue.start - last.end <= 0.5 {
+                          merged[merged.count - 1] = Cue(start: last.start, end: max(last.end, cue.end), text: last.text)
+                      } else {
+                          merged.append(cue)
+                      }
+                  }
+                  return merged
               }
 
               /// Japanese text of one display set: every bitmap rect is read, top to bottom.
-              private static func recognizeRects(_ sub: AVSubtitle) -> String {
+              private static func recognizeRects(_ sub: AVSubtitle, accurate: Bool) -> String {
                   var pieces: [(y: Int32, text: String)] = []
                   for i in 0..<Int(sub.num_rects) {
                       guard let rect = sub.rects[i]?.pointee, rect.type == SUBTITLE_BITMAP,
-                            let image = bitmapImage(rect) else { continue }
-                      let text = readJapanese(image)
+                            let image = bitmapImage(rect, scale: accurate ? 2 : 1) else { continue }
+                      let text = readJapanese(image, accurate: accurate)
                       if !text.isEmpty {
                           pieces.append((rect.y, text))
                       }
@@ -7140,8 +7153,8 @@ jobs:
                   return pieces.sorted { $0.y < $1.y }.map { $0.text }.joined(separator: "\n")
               }
 
-              /// PAL8 bitmap -> image over black, upscaled 2x (Vision reads larger glyphs better).
-              private static func bitmapImage(_ rect: AVSubtitleRect) -> CGImage? {
+              /// PAL8 bitmap -> image over black, upscaled (accurate mode: 2x, Vision reads larger glyphs better).
+              private static func bitmapImage(_ rect: AVSubtitleRect, scale: Int) -> CGImage? {
                   let w = Int(rect.w)
                   let h = Int(rect.h)
                   guard w > 0, h > 0, let indices = rect.data.0, let palette = rect.data.1 else { return nil }
@@ -7167,17 +7180,17 @@ jobs:
                                             bytesPerRow: w * 4, space: space, bitmapInfo: noAlpha,
                                             provider: provider, decode: nil, shouldInterpolate: false,
                                             intent: .defaultIntent) else { return nil }
-                  guard let context = CGContext(data: nil, width: w * 2, height: h * 2, bitsPerComponent: 8,
+                  guard let context = CGContext(data: nil, width: w * scale, height: h * scale, bitsPerComponent: 8,
                                                 bytesPerRow: 0, space: space, bitmapInfo: noAlpha.rawValue) else { return nil }
                   context.interpolationQuality = .high
-                  context.draw(small, in: CGRect(x: 0, y: 0, width: w * 2, height: h * 2))
+                  context.draw(small, in: CGRect(x: 0, y: 0, width: w * scale, height: h * scale))
                   return context.makeImage()
               }
 
-              private static func readJapanese(_ image: CGImage) -> String {
+              private static func readJapanese(_ image: CGImage, accurate: Bool) -> String {
                   let request = VNRecognizeTextRequest()
                   request.recognitionLanguages = ["ja-JP"]
-                  request.recognitionLevel = .accurate
+                  request.recognitionLevel = accurate ? .accurate : .fast
                   request.usesLanguageCorrection = false
                   let handler = VNImageRequestHandler(cgImage: image, options: [:])
                   guard (try? handler.perform([request])) != nil else { return "" }
@@ -7486,6 +7499,8 @@ jobs:
               @Published var names: [String] = []
               @Published var progress: [String: Double] = [:]
               @Published var status: [String: String] = [:]
+              /// Video waiting for the user's choice of recognition mode.
+              @Published var pendingChoice: URL? = nil
 
               private static let videoExtensions: Set<String> = ["mkv", "mp4", "mov", "m4v", "webm", "avi"]
 
@@ -7515,13 +7530,40 @@ jobs:
                   }
                   reload()
                   if VideoLibraryStore.isVideo(dest.lastPathComponent) {
-                      convertSubtitles(dest)
+                      askOrConvert(dest)
                   }
+              }
+
+              /// Picture-only Japanese subtitles need OCR: the user chooses the mode first. Text tracks need no choice.
+              private func askOrConvert(_ video: URL) {
+                  let name = video.lastPathComponent
+                  status[name] = "проверяю дорожки…"
+                  Task { @MainActor in
+                      let needsOCR = await Task.detached(priority: .utility) { () -> Bool in
+                          let japanese = ["jpn", "ja", "jap"]
+                          let streams = EmbeddedSubtitles.subtitleStreams(url: video)
+                          let hasText = streams.contains { $0.isText && japanese.contains($0.language) }
+                          let hasPicture = streams.contains { !$0.isText && japanese.contains($0.language) }
+                          return hasPicture && !hasText
+                      }.value
+                      if needsOCR {
+                          status[name] = nil
+                          pendingChoice = video
+                      } else {
+                          convertSubtitles(video, accurate: true)
+                      }
+                  }
+              }
+
+              func startPending(accurate: Bool) {
+                  guard let video = pendingChoice else { return }
+                  pendingChoice = nil
+                  convertSubtitles(video, accurate: accurate)
               }
 
               /// Background job for one video: reads its Japanese text track and writes it as SRT next to the video.
               /// Picture tracks are reported, not converted yet.
-              func convertSubtitles(_ video: URL) {
+              func convertSubtitles(_ video: URL, accurate: Bool) {
                   let name = video.lastPathComponent
                   status[name] = "ищу японские субтитры…"
                   progress[name] = 0
@@ -7537,7 +7579,8 @@ jobs:
                           if let track = streams.first(where: { $0.isText && japanese.contains($0.language) }) {
                               cues = EmbeddedSubtitles.extract(url: video, streamIndex: track.index, progress: report) ?? []
                           } else if let picture = streams.first(where: { !$0.isText && japanese.contains($0.language) }) {
-                              cues = EmbeddedSubtitles.pictureCues(url: video, streamIndex: picture.index, progress: report)
+                              cues = EmbeddedSubtitles.pictureCues(url: video, streamIndex: picture.index,
+                                                                   accurate: accurate, progress: report)
                           } else {
                               return "японских субтитров нет"
                           }
@@ -7589,6 +7632,16 @@ jobs:
                       }, onCancel: {
                           showImporter = false
                       })
+                  }
+                  .confirmationDialog("Японские субтитры-картинки",
+                                      isPresented: Binding(get: { library.pendingChoice != nil },
+                                                           set: { if !$0 { library.pendingChoice = nil } }),
+                                      titleVisibility: .visible) {
+                      Button("Точный (медленнее)") { library.startPending(accurate: true) }
+                      Button("Быстрый") { library.startPending(accurate: false) }
+                      Button("Не распознавать", role: .cancel) { library.pendingChoice = nil }
+                  } message: {
+                      Text("Точный режим читает мелкий текст точнее. Быстрый заметно быстрее, но ошибок будет больше.")
                   }
                   .onAppear {
                       library.reload()
