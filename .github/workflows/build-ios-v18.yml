@@ -5846,6 +5846,161 @@ jobs:
               }
           }
 
+          /// Text subtitles read straight from the file, ahead of playback.
+          /// Packets of the subtitle track already contain the text (SRT, ASS/SSA, mov_text, WebVTT),
+          /// so no decoder is needed. Bitmap tracks (PGS, VobSub) have no text and are not read here.
+          enum EmbeddedSubtitles {
+              struct Cue {
+                  let start: Double
+                  let end: Double
+                  let text: String
+              }
+
+              static func extract(url: URL, preferredLanguages: [String] = ["jpn", "ja", "jap"]) -> [Cue]? {
+                  var opened: UnsafeMutablePointer<AVFormatContext>? = nil
+                  guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return nil }
+                  defer {
+                      var closing: UnsafeMutablePointer<AVFormatContext>? = fmt
+                      avformat_close_input(&closing)
+                  }
+                  guard avformat_find_stream_info(fmt, nil) >= 0, let streams = fmt.pointee.streams else { return nil }
+                  let count = Int(fmt.pointee.nb_streams)
+
+                  // choose a text subtitle track: Japanese first, then any other text track
+                  var target: Int? = nil
+                  var targetIsPreferred = false
+                  for i in 0..<count {
+                      guard let st = streams[i], let par = st.pointee.codecpar else { continue }
+                      guard par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE, isTextCodec(par.pointee.codec_id) else { continue }
+                      let preferred = preferredLanguages.contains(language(of: st))
+                      if target == nil || (preferred && !targetIsPreferred) {
+                          target = i
+                          targetIsPreferred = preferred
+                      }
+                  }
+                  guard let index = target, let stream = streams[index], let par = stream.pointee.codecpar else { return nil }
+                  let codec = par.pointee.codec_id
+                  let timeBase = av_q2d(stream.pointee.time_base)
+                  // only the subtitle track is read: the other streams are skipped by the demuxer
+                  for i in 0..<count where i != index {
+                      streams[i]?.pointee.discard = AVDISCARD_ALL
+                  }
+
+                  guard let packet = av_packet_alloc() else { return nil }
+                  defer {
+                      var freed: UnsafeMutablePointer<AVPacket>? = packet
+                      av_packet_free(&freed)
+                  }
+                  var cues: [Cue] = []
+                  while av_read_frame(fmt, packet) >= 0 {
+                      defer { av_packet_unref(packet) }
+                      guard Int(packet.pointee.stream_index) == index, let data = packet.pointee.data else { continue }
+                      var ts = packet.pointee.pts
+                      if ts == Int64.min { ts = packet.pointee.dts }
+                      guard ts != Int64.min else { continue }
+                      let start = Double(ts) * timeBase
+                      let duration = Double(packet.pointee.duration) * timeBase
+                      let raw = Data(bytes: data, count: Int(packet.pointee.size))
+                      let text = cueText(raw, codec: codec)
+                      if !text.isEmpty {
+                          cues.append(Cue(start: start, end: duration > 0 ? start + duration : start + 4, text: text))
+                      }
+                  }
+                  return cues.sorted { $0.start < $1.start }
+              }
+
+              /// Cues of an external file (.srt, .vtt, .ass, .ssa).
+              static func cues(fromFile url: URL) -> [Cue] {
+                  guard let text = SubtitleSync.readText(url) else { return [] }
+                  let lines = text.components(separatedBy: .newlines)
+                  var cues: [Cue] = []
+                  if text.contains("Dialogue:") {
+                      for line in lines where line.hasPrefix("Dialogue:") {
+                          let fields = line.dropFirst("Dialogue:".count)
+                              .split(separator: ",", maxSplits: 9, omittingEmptySubsequences: false)
+                          guard fields.count == 10,
+                                let start = seconds(String(fields[1])),
+                                let end = seconds(String(fields[2])) else { continue }
+                          let body = clean(String(fields[9]))
+                          if !body.isEmpty { cues.append(Cue(start: start, end: end, text: body)) }
+                      }
+                  } else {
+                      var i = 0
+                      while i < lines.count {
+                          if lines[i].contains("-->") {
+                              let parts = lines[i].components(separatedBy: "-->")
+                              if parts.count == 2,
+                                 let start = seconds(parts[0].trimmingCharacters(in: .whitespaces)),
+                                 let end = seconds(parts[1].trimmingCharacters(in: .whitespaces)
+                                                      .components(separatedBy: " ").first ?? "") {
+                                  var body: [String] = []
+                                  var j = i + 1
+                                  while j < lines.count, !lines[j].trimmingCharacters(in: .whitespaces).isEmpty {
+                                      body.append(lines[j])
+                                      j += 1
+                                  }
+                                  let t = clean(body.joined(separator: "\n"))
+                                  if !t.isEmpty { cues.append(Cue(start: start, end: end, text: t)) }
+                                  i = j
+                                  continue
+                              }
+                          }
+                          i += 1
+                      }
+                  }
+                  return cues.sorted { $0.start < $1.start }
+              }
+
+              private static func isTextCodec(_ id: AVCodecID) -> Bool {
+                  [AV_CODEC_ID_SUBRIP, AV_CODEC_ID_ASS, AV_CODEC_ID_SSA, AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_WEBVTT].contains(id)
+              }
+
+              private static func language(of stream: UnsafeMutablePointer<AVStream>) -> String {
+                  guard let entry = av_dict_get(stream.pointee.metadata, "language", nil, 0),
+                        let value = entry.pointee.value else { return "" }
+                  return String(cString: value).lowercased()
+              }
+
+              private static func cueText(_ raw: Data, codec: AVCodecID) -> String {
+                  if codec == AV_CODEC_ID_MOV_TEXT {
+                      // mov_text: 2-byte big-endian length, then UTF-8 text
+                      guard raw.count > 2 else { return "" }
+                      let length = Int(raw[0]) << 8 | Int(raw[1])
+                      let end = min(raw.count, 2 + length)
+                      return clean(String(data: raw.subdata(in: 2..<end), encoding: .utf8) ?? "")
+                  }
+                  var text = String(data: raw, encoding: .utf8) ?? ""
+                  if codec == AV_CODEC_ID_ASS || codec == AV_CODEC_ID_SSA {
+                      // packet layout: ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+                      let fields = text.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
+                      if fields.count == 9 { text = String(fields[8]) }
+                  }
+                  return clean(text)
+              }
+
+              /// "00:01:02,250", "00:01:02.250", "1:02.250" -> seconds
+              private static func seconds(_ raw: String) -> Double? {
+                  let parts = raw.replacingOccurrences(of: ",", with: ".")
+                      .split(separator: ":").map(String.init)
+                  guard let last = parts.last, var total = Double(last) else { return nil }
+                  var factor = 60.0
+                  for part in parts.dropLast().reversed() {
+                      guard let value = Double(part) else { return nil }
+                      total += value * factor
+                      factor *= 60
+                  }
+                  return total
+              }
+
+              private static func clean(_ raw: String) -> String {
+                  var out = raw.replacingOccurrences(of: "\\N", with: "\n")
+                      .replacingOccurrences(of: "\\n", with: " ")
+                  out = out.replacingOccurrences(of: "\\{[^}]*\\}", with: "", options: .regularExpression)
+                  out = out.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                  return out.trimmingCharacters(in: .whitespacesAndNewlines)
+              }
+          }
+
           /// Bitmap subtitles have no text: Japanese text is read from the picture with Vision.
           enum SubtitleOCR {
               static func recognize(_ image: UIImage, completion: @escaping (String) -> Void) {
