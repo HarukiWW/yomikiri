@@ -5948,7 +5948,8 @@ jobs:
               /// KSPlayer overwrites coordinator.onStateChanged, so tracks are polled until they appear.
               /// Text Japanese subtitles win over bitmap ones (bitmap subtitles cannot be looked up).
               @MainActor
-              static func autoSelectJapanese(coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool) async {
+              static func autoSelectJapanese(coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool,
+                                             excluded: Set<Int> = []) async {
                   guard prefersJapanese else { return }
                   var audioDone = false
                   var subtitleDone = !pickSubtitle
@@ -5966,7 +5967,9 @@ jobs:
                           }
                       }
                       if !subtitleDone {
-                          let infos = coordinator.subtitleModel.subtitleInfos
+                          let infos = coordinator.subtitleModel.subtitleInfos.filter { info in
+                              !((info as? FFmpegAssetTrack).map { excluded.contains(Int($0.trackID)) } ?? false)
+                          }
                           if !infos.isEmpty {
                               let japanese = infos.filter { info in
                                   guard let track = info as? FFmpegAssetTrack else { return false }
@@ -6453,7 +6456,12 @@ jobs:
                   // Japanese is chosen by default, the external file is not replaced by the default choice
                   extractMessage = "субтитры: выберите дорожку в меню субтитров"
                   let hasExternal = NativeVideoEngine.sidecarSubtitle(for: url) != nil
-                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: !hasExternal)
+                  let videoURL = url
+                  let excluded = await Task.detached(priority: .utility) {
+                      EmbeddedSubtitles.nonDialogueStreams(url: videoURL)
+                  }.value
+                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: !hasExternal,
+                                                             excluded: excluded)
               }
 
               private var subToolsPanel: some View {
@@ -6669,30 +6677,52 @@ jobs:
                           if !body.isEmpty { cues.append(Cue(start: start, end: end, text: body)) }
                       }
                   } else {
-                      var i = 0
-                      while i < lines.count {
-                          if lines[i].contains("-->") {
-                              let parts = lines[i].components(separatedBy: "-->")
-                              if parts.count == 2,
-                                 let start = seconds(parts[0].trimmingCharacters(in: .whitespaces)),
-                                 let end = seconds(parts[1].trimmingCharacters(in: .whitespaces)
-                                                      .components(separatedBy: " ").first ?? "") {
-                                  var body: [String] = []
-                                  var j = i + 1
-                                  while j < lines.count, !lines[j].trimmingCharacters(in: .whitespaces).isEmpty {
-                                      body.append(lines[j])
-                                      j += 1
-                                  }
-                                  let t = clean(body.joined(separator: "\n"))
-                                  if !t.isEmpty { cues.append(Cue(start: start, end: end, text: t)) }
-                                  i = j
-                                  continue
-                              }
+                      // SRT and WebVTT, whole text in one pass (hours are optional in WebVTT)
+                      let t = #"(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})"#
+                      guard let re = try? NSRegularExpression(pattern: t + #"\s*-->\s*"# + t + #"[^\r\n]*"#) else { return [] }
+                      let ns = text as NSString
+                      let matches = re.matches(in: text, range: NSRange(location: 0, length: ns.length))
+                      for (k, m) in matches.enumerated() {
+                          let start = timeValue(ns, m, from: 1)
+                          let end = timeValue(ns, m, from: 5)
+                          let bodyStart = m.range.location + m.range.length
+                          let bodyEnd = k + 1 < matches.count ? matches[k + 1].range.location : ns.length
+                          var lines = ns.substring(with: NSRange(location: bodyStart, length: bodyEnd - bodyStart))
+                              .components(separatedBy: .newlines)
+                              .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+                          if let last = lines.last?.trimmingCharacters(in: .whitespaces),
+                             !last.isEmpty, last.allSatisfy({ $0.isASCII && $0.isNumber }) {
+                              lines.removeLast()          // number of the next cue
                           }
-                          i += 1
+                          let body = clean(lines.joined(separator: "\n"))
+                          if !body.isEmpty { cues.append(Cue(start: start, end: end, text: body)) }
                       }
                   }
                   return cues.sorted { $0.start < $1.start }
+              }
+
+              /// Subtitle streams whose title says they are not dialogue (romaji, karaoke, signs, songs).
+              static func nonDialogueStreams(url: URL) -> Set<Int> {
+                  var opened: UnsafeMutablePointer<AVFormatContext>? = nil
+                  guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return [] }
+                  defer {
+                      var closing: UnsafeMutablePointer<AVFormatContext>? = fmt
+                      avformat_close_input(&closing)
+                  }
+                  guard avformat_find_stream_info(fmt, nil) >= 0, let streams = fmt.pointee.streams else { return [] }
+                  let markers = ["romaji", "rōmaji", "karaoke", "sign", "song", "ローマ", "看板", "ソング"]
+                  var result = Set<Int>()
+                  for i in 0..<Int(fmt.pointee.nb_streams) {
+                      guard let st = streams[i], let par = st.pointee.codecpar,
+                            par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE,
+                            let entry = av_dict_get(st.pointee.metadata, "title", nil, 0),
+                            let value = entry.pointee.value else { continue }
+                      let title = String(cString: value).lowercased()
+                      if markers.contains(where: { title.contains($0) }) {
+                          result.insert(i)
+                      }
+                  }
+                  return result
               }
 
               private static func isTextCodec(_ id: AVCodecID) -> Bool {
@@ -6720,6 +6750,20 @@ jobs:
                       if fields.count == 9 { text = String(fields[8]) }
                   }
                   return clean(text)
+              }
+
+              /// Seconds from regex groups: optional hours, minutes, seconds, fraction; starting at group `from`.
+              private static func timeValue(_ ns: NSString, _ m: NSTextCheckingResult, from g: Int) -> Double {
+                  func part(_ i: Int) -> String? {
+                      let r = m.range(at: i)
+                      return r.location == NSNotFound ? nil : ns.substring(with: r)
+                  }
+                  let h = Double(part(g) ?? "0") ?? 0
+                  let mi = Double(part(g + 1) ?? "0") ?? 0
+                  let s = Double(part(g + 2) ?? "0") ?? 0
+                  let frac = part(g + 3) ?? "0"
+                  let f = (Double(frac) ?? 0) / pow(10, Double(frac.count))
+                  return h * 3600 + mi * 60 + s + f
               }
 
               /// "00:01:02,250", "00:01:02.250", "1:02.250" -> seconds
