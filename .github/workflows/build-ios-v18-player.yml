@@ -7857,6 +7857,8 @@ jobs:
                   }
                   .presentationDetents([.medium, .large])
                   .presentationDragIndicator(.visible)
+                  .opacity(sheetOpacity)
+                  .modifier(SheetTransparency())
               }
           }
 
@@ -7994,8 +7996,6 @@ jobs:
                       store.status[name] = text
                       store.reload()
                   }
-                  .opacity(sheetOpacity)
-                  .modifier(SheetTransparency())
               }
           }
 
