@@ -6273,6 +6273,8 @@ jobs:
               @State private var lastOCRKey = -1
               @State private var textParts = 0
               @State private var imageParts = 0
+              @State private var trackKey = ""          // KSPlayer track we already reacted to
+              @State private var loadToken = 0          // ignores results of an older track
 
               private var delayKey: String { "subdelay." + url.lastPathComponent }
               private var cueSource: [EmbeddedSubtitles.Cue] { usingExternal ? externalCues : embeddedCues }
@@ -6351,6 +6353,7 @@ jobs:
                   .toolbar(.hidden, for: .tabBar)
                   .navigationBarHidden(true)
                   .onReceive(Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()) { _ in
+                      checkTrack()
                       guard let layer = coordinator.playerLayer else { return }
                       playbackTime = layer.player.currentPlaybackTime
                       let size = layer.player.naturalSize
@@ -6401,6 +6404,43 @@ jobs:
                   }
               }
 
+              /// Reacts to the subtitle track chosen in KSPlayer's menu.
+              /// Text track -> its cues are read from the file; picture track -> OCR of the picture.
+              private func checkTrack() {
+                  let selected = coordinator.subtitleModel.selectedSubtitleInfo
+                  let key = selected.map { ($0 is FFmpegAssetTrack ? "e" : "x") + $0.subtitleID } ?? ""
+                  guard key != trackKey else { return }
+                  trackKey = key
+                  guard let selected else {
+                      embeddedCues = []
+                      return
+                  }
+                  guard let track = selected as? FFmpegAssetTrack else {
+                      // external subtitle picked in KSPlayer (not used by this player)
+                      return
+                  }
+                  usingExternal = false
+                  if track.isImageSubtitle {
+                      embeddedCues = []
+                      extractMessage = "дорожка картинками: текст распознаётся (OCR)"
+                      return
+                  }
+                  loadToken += 1
+                  let token = loadToken
+                  let index = Int(track.trackID)
+                  let videoURL = url
+                  Task {
+                      let cues = await Task.detached(priority: .utility) {
+                          EmbeddedSubtitles.extract(url: videoURL, streamIndex: index) ?? []
+                      }.value
+                      guard token == loadToken else { return }
+                      embeddedCues = cues
+                      extractMessage = cues.isEmpty
+                          ? "в этой дорожке текста не найдено"
+                          : "субтитры из дорожки: \(cues.count) реплик"
+                  }
+              }
+
               @MainActor
               private func loadSubtitles() async {
                   subDelay = UserDefaults.standard.double(forKey: delayKey)
@@ -6409,21 +6449,11 @@ jobs:
                       externalCues = EmbeddedSubtitles.cues(fromFile: sidecar)
                       usingExternal = !externalCues.isEmpty
                   }
-                  // reading the file is done in the background, the picture is not waiting for it
-                  let videoURL = url
-                  let cues = await Task.detached(priority: .utility) {
-                      EmbeddedSubtitles.extract(url: videoURL) ?? []
-                  }.value
-                  embeddedCues = cues
-                  if cues.isEmpty {
-                      extractMessage = "в файле нет текстовых субтитров (картинки и OCR — запасной вариант)"
-                  } else {
-                      extractMessage = "субтитры из файла: \(cues.count) реплик"
-                  }
-                  // no text cues (e.g. bitmap subtitles): let KSPlayer deliver the picture subtitles,
-                  // they are read with OCR into the same line
-                  let needPicture = cues.isEmpty && NativeVideoEngine.sidecarSubtitle(for: url) == nil
-                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: needPicture)
+                  // the subtitle text follows the track chosen in KSPlayer's subtitle menu (checkTrack);
+                  // Japanese is chosen by default, the external file is not replaced by the default choice
+                  extractMessage = "субтитры: выберите дорожку в меню субтитров"
+                  let hasExternal = NativeVideoEngine.sidecarSubtitle(for: url) != nil
+                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: !hasExternal)
               }
 
               private var subToolsPanel: some View {
@@ -6533,9 +6563,14 @@ jobs:
                   externalURL = dest
                   externalCues = EmbeddedSubtitles.cues(fromFile: dest)
                   usingExternal = !externalCues.isEmpty
-                  syncMessage = externalCues.isEmpty
-                      ? "В файле не найдено реплик"
-                      : "Субтитры добавлены: \(externalCues.count) реплик"
+                  if externalCues.isEmpty {
+                      let raw = SubtitleSync.readText(dest) ?? ""
+                      let firstLine = raw.components(separatedBy: .newlines)
+                          .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty } ?? ""
+                      syncMessage = "В файле не найдено реплик: символов \(raw.count), первая строка: «\(String(firstLine.prefix(40)))»"
+                  } else {
+                      syncMessage = "Субтитры добавлены: \(externalCues.count) реплик"
+                  }
               }
 
               private func lookup(_ token: LookupToken) {
@@ -6556,7 +6591,8 @@ jobs:
                   let text: String
               }
 
-              static func extract(url: URL, preferredLanguages: [String] = ["jpn", "ja", "jap"]) -> [Cue]? {
+              static func extract(url: URL, streamIndex: Int? = nil,
+                                  preferredLanguages: [String] = ["jpn", "ja", "jap"]) -> [Cue]? {
                   var opened: UnsafeMutablePointer<AVFormatContext>? = nil
                   guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return nil }
                   defer {
@@ -6568,14 +6604,22 @@ jobs:
 
                   // choose a text subtitle track: Japanese first, then any other text track
                   var target: Int? = nil
-                  var targetIsPreferred = false
-                  for i in 0..<count {
-                      guard let st = streams[i], let par = st.pointee.codecpar else { continue }
-                      guard par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE, isTextCodec(par.pointee.codec_id) else { continue }
-                      let preferred = preferredLanguages.contains(language(of: st))
-                      if target == nil || (preferred && !targetIsPreferred) {
-                          target = i
-                          targetIsPreferred = preferred
+                  if let wanted = streamIndex {
+                      // the track the user chose in KSPlayer's subtitle menu
+                      if wanted >= 0, wanted < count, let st = streams[wanted], let par = st.pointee.codecpar,
+                         par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE, isTextCodec(par.pointee.codec_id) {
+                          target = wanted
+                      }
+                  } else {
+                      var targetIsPreferred = false
+                      for i in 0..<count {
+                          guard let st = streams[i], let par = st.pointee.codecpar else { continue }
+                          guard par.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE, isTextCodec(par.pointee.codec_id) else { continue }
+                          let preferred = preferredLanguages.contains(language(of: st))
+                          if target == nil || (preferred && !targetIsPreferred) {
+                              target = i
+                              targetIsPreferred = preferred
+                          }
                       }
                   }
                   guard let index = target, let stream = streams[index], let par = stream.pointee.codecpar else { return nil }
