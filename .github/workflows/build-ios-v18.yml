@@ -7707,20 +7707,42 @@ jobs:
           python3 - <<'PY'
           import pathlib
 
-          # Safari extension native handler: every request is logged (Console app on a Mac shows it),
-          # unknown keys are answered instead of never completing (a pending promise looks like "nothing works").
+          # ---------- 1. shared log (app + Safari extension) ----------
+          utils = pathlib.Path("src/safari/YomikiriTokenizer/YomikiriTokenizer/Utils.swift")
+          u = utils.read_text(encoding="utf-8")
+          if "func extLogAppend" not in u:
+              u = u.rstrip("\n") + '''
+
+          /// Short request log shared by the app and the Safari extension (shown in the diagnostics screen).
+          public func extLogAppend(_ line: String) {
+              let stamp = ISO8601DateFormatter().string(from: Date())
+              var lines = (sharedStoreRead("ext.log") ?? "").split(separator: "\\n").map(String.init)
+              lines.append(stamp + " " + line)
+              if lines.count > 80 {
+                  lines.removeFirst(lines.count - 80)
+              }
+              sharedStoreWrite("ext.log", lines.joined(separator: "\\n"))
+          }
+
+          public func extLogText() -> String {
+              let text = sharedStoreRead("ext.log") ?? ""
+              return text.isEmpty ? "(пусто: расширение ещё не получало запросов)" : text
+          }
+          '''
+              utils.write_text(u, encoding="utf-8")
+              print("utils: shared log added")
+
+          # ---------- 2. extension handler: log requests and errors, answer every key ----------
           h = pathlib.Path("src/safari/iOS (Extension)/IOSWebExtensionHandler.swift")
           s = h.read_text(encoding="utf-8")
-          if "yomikiri request" in s:
-              print("safari handler: already patched")
-          else:
+          if "extLogAppend" not in s:
               old_head = "        let completionHandler = context.completeRequest\n"
               assert s.count(old_head) == 1, "handler head changed"
-              s = s.replace(old_head, old_head + "        os_log(.info, \"yomikiri request: %{public}s\", key)\n")
+              s = s.replace(old_head, old_head + '        extLogAppend("запрос: " + key)\n')
 
-              old_tts_voices_anchor = '                case "getDictMetadata":\n                    jsonResponse = try Backend.get().metadata()\n'
-              assert s.count(old_tts_voices_anchor) == 1, "getDictMetadata case changed"
-              s = s.replace(old_tts_voices_anchor, old_tts_voices_anchor +
+              anchor = '                case "getDictMetadata":\n                    jsonResponse = try Backend.get().metadata()\n'
+              assert s.count(anchor) == 1, "getDictMetadata case changed"
+              s = s.replace(anchor, anchor +
                             '                case "ttsVoices":\n'
                             '                    // TTS is not used on iOS: no voices, but the request is answered\n'
                             '                    jsonResponse = "[]"\n')
@@ -7729,10 +7751,24 @@ jobs:
               assert s.count(old_default) == 1, "default changed"
               s = s.replace(old_default,
                             "                default:\n"
-                            "                    os_log(.error, \"yomikiri unknown request: %{public}s\", key)\n"
+                            "                    extLogAppend(\"неизвестный запрос: \" + key)\n"
                             "                    jsonResponse = \"null\"\n")
+
+              old_catch = '            } catch {\n                os_log(.error, "Error: %{public}s", String(describing: error))\n'
+              assert s.count(old_catch) == 1, "generic catch changed"
+              s = s.replace(old_catch, old_catch + '                extLogAppend("ошибка " + key + ": " + error.localizedDescription)\n')
               h.write_text(s, encoding="utf-8")
-              print("safari handler: logging, ttsVoices and unknown-key answer added")
+              print("handler: request log, ttsVoices, unknown-key answer, error log")
+
+          # ---------- 3. diagnostics screen shows the log ----------
+          hv = pathlib.Path("src/safari/iOS (App)/HelpView.swift")
+          t = hv.read_text(encoding="utf-8")
+          old_diag = "diag = sharedStorageReport()\n"
+          assert t.count(old_diag) == 1, "diag line count=%d" % t.count(old_diag)
+          if "extLogText()" not in t:
+              t = t.replace(old_diag, 'diag = sharedStorageReport() + "\\n\\nЖурнал Safari-расширения:\\n" + extLogText()\n')
+              hv.write_text(t, encoding="utf-8")
+              print("diagnostics: extension log added")
           PY
 
       - name: Pre-generate files that Xcode expects to already exist
