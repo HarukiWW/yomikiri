@@ -6565,16 +6565,24 @@ jobs:
               }
 
               private var delayRow: some View {
-                  HStack(spacing: 10) {
-                      Button("−0.5") { shiftDelay(-0.5) }
-                      Button("−0.1") { shiftDelay(-0.1) }
+                  HStack(spacing: 8) {
+                      delayButton("−0.5") { shiftDelay(-0.5) }
+                      delayButton("−0.1") { shiftDelay(-0.1) }
                       Text(String(format: "%+.2f с", subDelay))
                           .font(.body.monospacedDigit())
+                          .lineLimit(1)
                           .frame(maxWidth: .infinity)
-                      Button("+0.1") { shiftDelay(0.1) }
-                      Button("+0.5") { shiftDelay(0.5) }
+                      delayButton("+0.1") { shiftDelay(0.1) }
+                      delayButton("+0.5") { shiftDelay(0.5) }
                   }
-                  .buttonStyle(.bordered)
+              }
+
+              /// Buttons keep their natural width: the labels never wrap onto two lines.
+              private func delayButton(_ title: String, _ action: @escaping () -> Void) -> some View {
+                  Button(title, action: action)
+                      .buttonStyle(.bordered)
+                      .lineLimit(1)
+                      .fixedSize()
               }
 
               private func trackRow(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -6819,9 +6827,15 @@ jobs:
                       externalCues = EmbeddedSubtitles.cues(fromFile: sidecar)
                       usingExternal = !externalCues.isEmpty
                       runAutoSync(file: sidecar, automatic: true)
+                  } else if let generated = generatedSubtitleURL() {
+                      // SRT made from the video's own picture track: same timings, text for lookup and mining
+                      externalURLs = [generated]
+                      activeExternal = generated
+                      externalCues = EmbeddedSubtitles.cues(fromFile: generated)
+                      usingExternal = !externalCues.isEmpty
                   }
                   extractMessage = "субтитры: выберите дорожку"
-                  let hasExternal = NativeVideoEngine.sidecarSubtitle(for: url) != nil
+                  let hasExternal = NativeVideoEngine.sidecarSubtitle(for: url) != nil || generatedSubtitleURL() != nil
                   let videoURL = url
                   let skipped = await Task.detached(priority: .utility) {
                       EmbeddedSubtitles.nonDialogueStreams(url: videoURL)
@@ -6829,6 +6843,11 @@ jobs:
                   await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator,
                                                              pickSubtitle: !hasExternal,
                                                              excluded: skipped)
+              }
+
+              private func generatedSubtitleURL() -> URL? {
+                  let file = url.deletingPathExtension().appendingPathExtension("ja.srt")
+                  return FileManager.default.fileExists(atPath: file.path) ? file : nil
               }
 
               private func shiftDelay(_ by: Double) {
@@ -6931,7 +6950,8 @@ jobs:
               }
 
               static func extract(url: URL, streamIndex: Int? = nil,
-                                  preferredLanguages: [String] = ["jpn", "ja", "jap"]) -> [Cue]? {
+                                  preferredLanguages: [String] = ["jpn", "ja", "jap"],
+                                  progress: ((Double) -> Void)? = nil) -> [Cue]? {
                   var opened: UnsafeMutablePointer<AVFormatContext>? = nil
                   guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return nil }
                   defer {
@@ -6975,9 +6995,18 @@ jobs:
                       av_packet_free(&freed)
                   }
                   var cues: [Cue] = []
+                  let fileSize = Double((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0)
+                  var reported = 0.0
                   while av_read_frame(fmt, packet) >= 0 {
                       defer { av_packet_unref(packet) }
                       guard Int(packet.pointee.stream_index) == index, let data = packet.pointee.data else { continue }
+                      if let progress, fileSize > 0, let pb = fmt.pointee.pb {
+                          let fraction = min(1, Double(pb.pointee.pos) / fileSize)
+                          if fraction - reported >= 0.01 {
+                              reported = fraction
+                              progress(fraction)
+                          }
+                      }
                       var ts = packet.pointee.pts
                       if ts == Int64.min { ts = packet.pointee.dts }
                       guard ts != Int64.min else { continue }
@@ -7030,6 +7059,149 @@ jobs:
                       }
                   }
                   return cues.sorted { $0.start < $1.start }
+              }
+
+              /// Picture subtitles (PGS): every display set is decoded with libavcodec, each picture is upscaled
+              /// and read with Vision (Japanese). Cues get their times from the packets and the display times.
+              static func pictureCues(url: URL, streamIndex index: Int,
+                                      progress: ((Double) -> Void)? = nil) -> [Cue] {
+                  var opened: UnsafeMutablePointer<AVFormatContext>? = nil
+                  guard avformat_open_input(&opened, url.path, nil, nil) == 0, let fmt = opened else { return [] }
+                  defer {
+                      var closing: UnsafeMutablePointer<AVFormatContext>? = fmt
+                      avformat_close_input(&closing)
+                  }
+                  guard avformat_find_stream_info(fmt, nil) >= 0, let streams = fmt.pointee.streams else { return [] }
+                  let count = Int(fmt.pointee.nb_streams)
+                  guard index >= 0, index < count, let stream = streams[index], let par = stream.pointee.codecpar,
+                        let decoder = avcodec_find_decoder(par.pointee.codec_id),
+                        let ctx = avcodec_alloc_context3(decoder) else { return [] }
+                  defer {
+                      var freed: UnsafeMutablePointer<AVCodecContext>? = ctx
+                      avcodec_free_context(&freed)
+                  }
+                  guard avcodec_parameters_to_context(ctx, par) >= 0, avcodec_open2(ctx, decoder, nil) >= 0 else { return [] }
+                  let timeBase = av_q2d(stream.pointee.time_base)
+                  for i in 0..<count where i != index {
+                      streams[i]?.pointee.discard = AVDISCARD_ALL
+                  }
+                  guard let packet = av_packet_alloc() else { return [] }
+                  defer {
+                      var freed: UnsafeMutablePointer<AVPacket>? = packet
+                      av_packet_free(&freed)
+                  }
+                  let fileSize = Double((try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0)
+                  var reported = 0.0
+                  var cues: [Cue] = []
+                  while av_read_frame(fmt, packet) >= 0 {
+                      defer { av_packet_unref(packet) }
+                      guard Int(packet.pointee.stream_index) == index else { continue }
+                      if let progress, fileSize > 0, let pb = fmt.pointee.pb {
+                          let fraction = min(1, Double(pb.pointee.pos) / fileSize)
+                          if fraction - reported >= 0.01 {
+                              reported = fraction
+                              progress(fraction)
+                          }
+                      }
+                      var sub = AVSubtitle()
+                      var got: Int32 = 0
+                      guard avcodec_decode_subtitle2(ctx, &sub, &got, packet) >= 0, got != 0 else { continue }
+                      defer { avsubtitle_free(&sub) }
+                      var pts = packet.pointee.pts
+                      if pts == Int64.min { pts = packet.pointee.dts }
+                      guard pts != Int64.min else { continue }
+                      let base = Double(pts) * timeBase
+                      let start = base + Double(sub.start_display_time) / 1000
+                      let end = base + Double(sub.end_display_time) / 1000
+                      let text = recognizeRects(sub)
+                      if !text.isEmpty {
+                          cues.append(Cue(start: start, end: end, text: text))
+                      }
+                  }
+                  // a display set without an end time lasts until the next one (or 3 s at the end)
+                  for i in cues.indices where cues[i].end <= cues[i].start {
+                      let next = i + 1 < cues.count ? cues[i + 1].start : cues[i].start + 3
+                      cues[i] = Cue(start: cues[i].start, end: next, text: cues[i].text)
+                  }
+                  return cues.sorted { $0.start < $1.start }
+              }
+
+              /// Japanese text of one display set: every bitmap rect is read, top to bottom.
+              private static func recognizeRects(_ sub: AVSubtitle) -> String {
+                  var pieces: [(y: Int32, text: String)] = []
+                  for i in 0..<Int(sub.num_rects) {
+                      guard let rect = sub.rects[i]?.pointee, rect.type == SUBTITLE_BITMAP,
+                            let image = bitmapImage(rect) else { continue }
+                      let text = readJapanese(image)
+                      if !text.isEmpty {
+                          pieces.append((rect.y, text))
+                      }
+                  }
+                  return pieces.sorted { $0.y < $1.y }.map { $0.text }.joined(separator: "\n")
+              }
+
+              /// PAL8 bitmap -> image over black, upscaled 2x (Vision reads larger glyphs better).
+              private static func bitmapImage(_ rect: AVSubtitleRect) -> CGImage? {
+                  let w = Int(rect.w)
+                  let h = Int(rect.h)
+                  guard w > 0, h > 0, let indices = rect.data.0, let palette = rect.data.1 else { return nil }
+                  let stride = Int(rect.linesize.0)
+                  var pixels = [UInt8](repeating: 0, count: w * h * 4)
+                  for y in 0..<h {
+                      for x in 0..<w {
+                          let index = Int(indices[y * stride + x])
+                          // palette entries are 0xAARRGGBB
+                          let argb = UnsafeRawPointer(palette).load(fromByteOffset: index * 4, as: UInt32.self)
+                          let a = Int((argb >> 24) & 0xFF)
+                          let o = (y * w + x) * 4
+                          pixels[o] = UInt8(Int((argb >> 16) & 0xFF) * a / 255)
+                          pixels[o + 1] = UInt8(Int((argb >> 8) & 0xFF) * a / 255)
+                          pixels[o + 2] = UInt8(Int(argb & 0xFF) * a / 255)
+                          pixels[o + 3] = 255
+                      }
+                  }
+                  let space = CGColorSpaceCreateDeviceRGB()
+                  let noAlpha = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue)
+                  guard let provider = CGDataProvider(data: Data(pixels) as CFData),
+                        let small = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32,
+                                            bytesPerRow: w * 4, space: space, bitmapInfo: noAlpha,
+                                            provider: provider, decode: nil, shouldInterpolate: false,
+                                            intent: .defaultIntent) else { return nil }
+                  guard let context = CGContext(data: nil, width: w * 2, height: h * 2, bitsPerComponent: 8,
+                                                bytesPerRow: 0, space: space, bitmapInfo: noAlpha.rawValue) else { return nil }
+                  context.interpolationQuality = .high
+                  context.draw(small, in: CGRect(x: 0, y: 0, width: w * 2, height: h * 2))
+                  return context.makeImage()
+              }
+
+              private static func readJapanese(_ image: CGImage) -> String {
+                  let request = VNRecognizeTextRequest()
+                  request.recognitionLanguages = ["ja-JP"]
+                  request.recognitionLevel = .accurate
+                  request.usesLanguageCorrection = false
+                  let handler = VNImageRequestHandler(cgImage: image, options: [:])
+                  guard (try? handler.perform([request])) != nil else { return "" }
+                  // Vision's origin is bottom-left: the top lines come first
+                  let lines = (request.results ?? []).sorted { $0.boundingBox.minY > $1.boundingBox.minY }
+                  return lines.compactMap { $0.topCandidates(1).first?.string }.joined()
+              }
+
+              /// SRT text for cues (times in seconds, text may have several lines).
+              static func srtText(_ cues: [Cue]) -> String {
+                  var out = ""
+                  for (i, cue) in cues.enumerated() {
+                      out += "\(i + 1)\n\(srtTime(cue.start)) --> \(srtTime(cue.end))\n\(cue.text)\n\n"
+                  }
+                  return out
+              }
+
+              private static func srtTime(_ seconds: Double) -> String {
+                  let ms = Int((max(0, seconds) * 1000).rounded())
+                  let h = ms / 3_600_000
+                  let m = (ms % 3_600_000) / 60_000
+                  let sec = (ms % 60_000) / 1000
+                  let frac = ms % 1000
+                  return String(format: "%02d:%02d:%02d,%03d", h, m, sec, frac)
               }
 
               struct SubStream {
@@ -7096,11 +7268,32 @@ jobs:
                       guard Int(packet.pointee.stream_index) == index else { continue }
                       var ts = packet.pointee.pts
                       if ts == Int64.min { ts = packet.pointee.dts }
-                      if ts != Int64.min {
+                      if ts != Int64.min, let data = packet.pointee.data,
+                         isShowSet(data, Int(packet.pointee.size)) {
                           starts.append(Double(ts) * timeBase)
                       }
                   }
                   return starts.sorted()
+              }
+
+              /// PGS display set that shows an object. A clear set (no objects) only ends a subtitle.
+              /// Anything that is not PGS is kept.
+              private static func isShowSet(_ data: UnsafeMutablePointer<UInt8>, _ size: Int) -> Bool {
+                  var off = 0
+                  var sawSegment = false
+                  while off + 13 <= size {
+                      guard data[off] == 0x50, data[off + 1] == 0x47 else { return !sawSegment }
+                      sawSegment = true
+                      let type = data[off + 10]
+                      let length = Int(data[off + 11]) << 8 | Int(data[off + 12])
+                      if type == 0x16 {
+                          // composition segment: number of objects is the 11th payload byte
+                          let objects = off + 13 + 10
+                          return objects < size && data[objects] > 0
+                      }
+                      off += 13 + length
+                  }
+                  return !sawSegment
               }
 
               /// Subtitle streams whose title says they are not dialogue (romaji, karaoke, signs, songs).
@@ -7286,24 +7479,167 @@ jobs:
               }
           }
 
+          /// Video library: import, the background subtitle job of each video, and per-file progress.
+          @available(iOS 16.0, *)
+          @MainActor
+          final class VideoLibraryStore: ObservableObject {
+              @Published var names: [String] = []
+              @Published var progress: [String: Double] = [:]
+              @Published var status: [String: String] = [:]
+
+              private static let videoExtensions: Set<String> = ["mkv", "mp4", "mov", "m4v", "webm", "avi"]
+
+              static func isVideo(_ name: String) -> Bool {
+                  videoExtensions.contains((name as NSString).pathExtension.lowercased())
+              }
+
+              func reload() {
+                  names = YomikiriVideoLibrary.fileNames()
+              }
+
+              func importVideo(_ src: URL) {
+                  let access = src.startAccessingSecurityScopedResource()
+                  defer {
+                      if access { src.stopAccessingSecurityScopedResource() }
+                  }
+                  guard let dir = YomikiriMediaSchemeHandler.videosDirectory() else { return }
+                  var dest = dir.appendingPathComponent(src.lastPathComponent)
+                  if FileManager.default.fileExists(atPath: dest.path) {
+                      dest = dir.appendingPathComponent(String(UUID().uuidString.prefix(6)) + "_" + src.lastPathComponent)
+                  }
+                  do {
+                      try FileManager.default.copyItem(at: src, to: dest)
+                  } catch {
+                      status[src.lastPathComponent] = "не удалось скопировать"
+                      return
+                  }
+                  reload()
+                  if VideoLibraryStore.isVideo(dest.lastPathComponent) {
+                      convertSubtitles(dest)
+                  }
+              }
+
+              /// Background job for one video: reads its Japanese text track and writes it as SRT next to the video.
+              /// Picture tracks are reported, not converted yet.
+              func convertSubtitles(_ video: URL) {
+                  let name = video.lastPathComponent
+                  status[name] = "ищу японские субтитры…"
+                  progress[name] = 0
+                  let store = self
+                  Task { @MainActor in
+                      let text = await Task.detached(priority: .utility) { () -> String in
+                          let japanese = ["jpn", "ja", "jap"]
+                          let report: (Double) -> Void = { fraction in
+                              Task { @MainActor in store.progress[name] = fraction }
+                          }
+                          let streams = EmbeddedSubtitles.subtitleStreams(url: video)
+                          let cues: [EmbeddedSubtitles.Cue]
+                          if let track = streams.first(where: { $0.isText && japanese.contains($0.language) }) {
+                              cues = EmbeddedSubtitles.extract(url: video, streamIndex: track.index, progress: report) ?? []
+                          } else if let picture = streams.first(where: { !$0.isText && japanese.contains($0.language) }) {
+                              cues = EmbeddedSubtitles.pictureCues(url: video, streamIndex: picture.index, progress: report)
+                          } else {
+                              return "японских субтитров нет"
+                          }
+                          guard !cues.isEmpty else { return "текста в дорожке не найдено" }
+                          let out = video.deletingPathExtension().appendingPathExtension("ja.srt")
+                          do {
+                              try EmbeddedSubtitles.srtText(cues).write(to: out, atomically: true, encoding: .utf8)
+                          } catch {
+                              return "не удалось записать SRT"
+                          }
+                          return "SRT готов: \(cues.count) реплик"
+                      }.value
+                      store.progress[name] = nil
+                      store.status[name] = text
+                      store.reload()
+                  }
+              }
+          }
+
           @available(iOS 16.0, *)
           struct NativeVideoListView: View {
-              @State private var files: [String] = []
+              @StateObject private var library = VideoLibraryStore()
+              @State private var showImporter = false
 
               var body: some View {
                   List {
-                      if files.isEmpty {
-                          Text("Нет файлов. Откройте «Файлы» → На iPhone → Yomikiri → Videos и положите туда MKV или MP4.")
+                      if library.names.isEmpty {
+                          Text("Видео пока нет. Нажмите «+» и выберите файл.")
                               .foregroundColor(.secondary)
                       }
-                      ForEach(files, id: \.self) { name in
-                          NavigationLink(destination: NativeVideoPlayerScreen(url: NativeVideoEngine.fileURL(name))) {
-                              Text(name).lineLimit(2)
-                          }
+                      ForEach(library.names, id: \.self) { name in
+                          fileRow(name)
                       }
                   }
                   .navigationTitle("Видео")
-                  .onAppear { files = YomikiriVideoLibrary.fileNames() }
+                  .toolbar {
+                      ToolbarItem(placement: .navigationBarTrailing) {
+                          Button {
+                              showImporter = true
+                          } label: {
+                              Image(systemName: "plus")
+                          }
+                      }
+                  }
+                  .sheet(isPresented: $showImporter) {
+                      DocumentPicker(onPick: { picked in
+                          showImporter = false
+                          library.importVideo(picked)
+                      }, onCancel: {
+                          showImporter = false
+                      })
+                  }
+                  .onAppear {
+                      library.reload()
+                  }
+              }
+
+              @ViewBuilder
+              private func fileRow(_ name: String) -> some View {
+                  let ext = (name as NSString).pathExtension.uppercased()
+                  let row = HStack(spacing: 12) {
+                      Image(systemName: symbol(for: name))
+                          .font(.title2)
+                          .foregroundColor(.accentColor)
+                          .frame(width: 32)
+                      VStack(alignment: .leading, spacing: 4) {
+                          Text(name).lineLimit(1)
+                          HStack(spacing: 8) {
+                              Text(ext.isEmpty ? "—" : ext)
+                                  .font(.caption2.bold())
+                                  .padding(.horizontal, 6)
+                                  .padding(.vertical, 2)
+                                  .background(Color.secondary.opacity(0.2))
+                                  .cornerRadius(4)
+                              if let text = library.status[name] {
+                                  Text(text).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                              }
+                          }
+                          if let value = library.progress[name] {
+                              ProgressView(value: value)
+                          }
+                      }
+                  }
+                  if VideoLibraryStore.isVideo(name) {
+                      NavigationLink(destination: NativeVideoPlayerScreen(url: NativeVideoEngine.fileURL(name))) {
+                          row
+                      }
+                  } else {
+                      row
+                  }
+              }
+
+              private func symbol(for name: String) -> String {
+                  if VideoLibraryStore.isVideo(name) {
+                      return "film"
+                  }
+                  switch (name as NSString).pathExtension.lowercased() {
+                  case "srt", "ass", "ssa", "vtt":
+                      return "captions.bubble"
+                  default:
+                      return "doc"
+                  }
               }
           }
           '''
