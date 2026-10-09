@@ -5860,7 +5860,7 @@ jobs:
               m = re.search(r"^import SwiftUI\n", h, re.M)
               assert m, "HelpView.swift: 'import SwiftUI' not found"
               if "import KSPlayer" not in h:
-                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\nimport UniformTypeIdentifiers\nimport UIKit\nimport Vision\nimport Libavcodec\nimport Libavformat\nimport Libavutil\n" + h[m.end():]
+                  h = h[: m.end()] + "import AVFoundation\nimport KSPlayer\nimport UniformTypeIdentifiers\nimport UIKit\nimport ImageIO\nimport Vision\nimport Libavcodec\nimport Libavformat\nimport Libavutil\n" + h[m.end():]
 
               # 3a. video folder: Documents/Videos (visible in Files), migrate old App Group files once
               old_dir = (
@@ -6879,16 +6879,18 @@ jobs:
                   }
                   let video = url
                   Task { @MainActor in
-                      let result = await Task.detached(priority: .utility) { () -> (delay: Double, matches: Int, total: Int)? in
+                      let outcome = await Task.detached(priority: .utility) { () -> (reference: Int, result: (delay: Double, matches: Int, total: Int)?) in
                           let reference = EmbeddedSubtitles.referenceStarts(url: video)
-                          guard reference.count >= 8 else { return nil }
+                          guard reference.count >= 8 else { return (reference.count, nil) }
                           let external = EmbeddedSubtitles.cues(fromFile: file).map { $0.start }
-                          return SubtitleSync.bestOffset(reference: reference, external: external)
+                          return (reference.count, SubtitleSync.bestOffset(reference: reference, external: external))
                       }.value
-                      guard let result, result.matches >= max(8, result.total / 2) else {
-                          syncMessage = automatic
-                              ? "Авто: совпадений мало, задержка не изменена"
-                              : "Совпадений мало: похоже, файл от другой раздачи"
+                      guard let result = outcome.result, result.matches >= max(8, result.total / 2) else {
+                          if let result = outcome.result {
+                              syncMessage = "Совпадений мало: \(result.matches) из \(result.total) (эталон \(outcome.reference) точек)"
+                          } else {
+                              syncMessage = "Недостаточно данных для подбора: эталон \(outcome.reference) точек"
+                          }
                           return
                       }
                       subDelay = result.delay
@@ -7145,7 +7147,7 @@ jobs:
                   for i in 0..<Int(sub.num_rects) {
                       guard let rect = sub.rects[i]?.pointee, rect.type == SUBTITLE_BITMAP,
                             let image = bitmapImage(rect, scale: accurate ? 2 : 1) else { continue }
-                      let text = readJapanese(image, accurate: accurate)
+                      let text = readJapanese(image)
                       if !text.isEmpty {
                           pieces.append((rect.y, text))
                       }
@@ -7187,12 +7189,28 @@ jobs:
                   return context.makeImage()
               }
 
-              private static func readJapanese(_ image: CGImage, accurate: Bool) -> String {
+              /// Japanese text of one picture. Vision reads horizontal lines: a tall picture (vertical text) is also
+              /// read turned 90 degrees both ways, and the reading with more characters wins.
+              /// The fast mode uses the same recognizer: Vision's fast recognizer does not handle Japanese.
+              private static func readJapanese(_ image: CGImage) -> String {
+                  var best = recognize(image, orientation: .up)
+                  if image.height > image.width {
+                      for orientation in [CGImagePropertyOrientation.right, CGImagePropertyOrientation.left] {
+                          let candidate = recognize(image, orientation: orientation)
+                          if candidate.count > best.count {
+                              best = candidate
+                          }
+                      }
+                  }
+                  return best
+              }
+
+              private static func recognize(_ image: CGImage, orientation: CGImagePropertyOrientation) -> String {
                   let request = VNRecognizeTextRequest()
                   request.recognitionLanguages = ["ja-JP"]
-                  request.recognitionLevel = accurate ? .accurate : .fast
+                  request.recognitionLevel = .accurate
                   request.usesLanguageCorrection = false
-                  let handler = VNImageRequestHandler(cgImage: image, options: [:])
+                  let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
                   guard (try? handler.perform([request])) != nil else { return "" }
                   // Vision's origin is bottom-left: the top lines come first
                   let lines = (request.results ?? []).sorted { $0.boundingBox.minY > $1.boundingBox.minY }
@@ -7245,11 +7263,17 @@ jobs:
               static func referenceStarts(url: URL) -> [Double] {
                   let japanese = ["jpn", "ja", "jap"]
                   let streams = subtitleStreams(url: url)
-                  if let text = streams.first(where: { $0.isText && japanese.contains($0.language) })
-                      ?? streams.first(where: { $0.isText }) {
+                  // Japanese first: the generated .ja.srt comes from the Japanese picture track
+                  if let text = streams.first(where: { $0.isText && japanese.contains($0.language) }) {
                       return (extract(url: url, streamIndex: text.index) ?? []).map { $0.start }
                   }
-                  if let picture = streams.first(where: { japanese.contains($0.language) }) ?? streams.first {
+                  if let picture = streams.first(where: { !$0.isText && japanese.contains($0.language) }) {
+                      return packetStarts(url: url, streamIndex: picture.index)
+                  }
+                  if let text = streams.first(where: { $0.isText }) {
+                      return (extract(url: url, streamIndex: text.index) ?? []).map { $0.start }
+                  }
+                  if let picture = streams.first {
                       return packetStarts(url: url, streamIndex: picture.index)
                   }
                   return []
