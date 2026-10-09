@@ -5389,10 +5389,18 @@ jobs:
 
           enum SubtitleSync {
               static func readText(_ url: URL) -> String? {
-                  guard let data = try? Data(contentsOf: url) else { return nil }
-                  return String(data: data, encoding: .utf8)
-                      ?? String(data: data, encoding: .shiftJIS)
-                      ?? String(data: data, encoding: .utf16)
+                  guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+                  // byte order marks first: UTF-16 files (common for Japanese .srt) look like garbage as UTF-8
+                  if data.starts(with: [0xFF, 0xFE]) {
+                      return String(data: Data(data.dropFirst(2)), encoding: .utf16LittleEndian)
+                  }
+                  if data.starts(with: [0xFE, 0xFF]) {
+                      return String(data: Data(data.dropFirst(2)), encoding: .utf16BigEndian)
+                  }
+                  let bytes = data.starts(with: [0xEF, 0xBB, 0xBF]) ? Data(data.dropFirst(3)) : data
+                  return String(data: bytes, encoding: .utf8)
+                      ?? String(data: bytes, encoding: .shiftJIS)
+                      ?? String(data: bytes, encoding: .utf16)
               }
 
               /// Start time (seconds) of every cue in .srt / .vtt / .ass / .ssa text, sorted.
@@ -5723,7 +5731,10 @@ jobs:
                   } else {
                       extractMessage = "субтитры из файла: \(cues.count) реплик"
                   }
-                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: false)
+                  // no text cues (e.g. bitmap subtitles): let KSPlayer deliver the picture subtitles,
+                  // they are read with OCR into the same line
+                  let needPicture = cues.isEmpty && NativeVideoEngine.sidecarSubtitle(for: url) == nil
+                  await NativeVideoEngine.autoSelectJapanese(coordinator: coordinator, pickSubtitle: needPicture)
               }
 
               private var subToolsPanel: some View {
@@ -7689,6 +7700,39 @@ jobs:
           else:
               assert "void refreshCustom();" in f, "allTables changed"
               print("frequency: already non-blocking")
+          PY
+
+      - name: Safari native handler - answer every request, log requests
+        run: |
+          python3 - <<'PY'
+          import pathlib
+
+          # Safari extension native handler: every request is logged (Console app on a Mac shows it),
+          # unknown keys are answered instead of never completing (a pending promise looks like "nothing works").
+          h = pathlib.Path("src/safari/iOS (Extension)/IOSWebExtensionHandler.swift")
+          s = h.read_text(encoding="utf-8")
+          if "yomikiri request" in s:
+              print("safari handler: already patched")
+          else:
+              old_head = "        let completionHandler = context.completeRequest\n"
+              assert s.count(old_head) == 1, "handler head changed"
+              s = s.replace(old_head, old_head + "        os_log(.info, \"yomikiri request: %{public}s\", key)\n")
+
+              old_tts_voices_anchor = '                case "getDictMetadata":\n                    jsonResponse = try Backend.get().metadata()\n'
+              assert s.count(old_tts_voices_anchor) == 1, "getDictMetadata case changed"
+              s = s.replace(old_tts_voices_anchor, old_tts_voices_anchor +
+                            '                case "ttsVoices":\n'
+                            '                    // TTS is not used on iOS: no voices, but the request is answered\n'
+                            '                    jsonResponse = "[]"\n')
+
+              old_default = "                default:\n                    return\n"
+              assert s.count(old_default) == 1, "default changed"
+              s = s.replace(old_default,
+                            "                default:\n"
+                            "                    os_log(.error, \"yomikiri unknown request: %{public}s\", key)\n"
+                            "                    jsonResponse = \"null\"\n")
+              h.write_text(s, encoding="utf-8")
+              print("safari handler: logging, ttsVoices and unknown-key answer added")
           PY
 
       - name: Pre-generate files that Xcode expects to already exist
