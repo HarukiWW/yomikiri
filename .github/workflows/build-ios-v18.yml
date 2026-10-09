@@ -5243,6 +5243,23 @@ jobs:
                       }
                   }
               }
+
+              static func fileURL(_ name: String) -> URL {
+                  let dir = YomikiriMediaSchemeHandler.videosDirectory() ?? FileManager.default.temporaryDirectory
+                  return dir.appendingPathComponent(name)
+              }
+
+              /// External subtitle with the same name as the video: .srt / .ass / .ssa / .vtt
+              static func sidecarSubtitle(for url: URL) -> URL? {
+                  let base = url.deletingPathExtension()
+                  for ext in ["srt", "ass", "ssa", "vtt"] {
+                      let candidate = base.appendingPathExtension(ext)
+                      if FileManager.default.fileExists(atPath: candidate.path) {
+                          return candidate
+                      }
+                  }
+                  return nil
+              }
           }
 
           struct LookupToken: Identifiable {
@@ -5342,9 +5359,11 @@ jobs:
                   func part(_ i: Int) -> String { ns.substring(with: match.range(at: i)) }
                   let frac = part(fraction)
                   let f = (Double(frac) ?? 0) / pow(10, Double(frac.count))
-                  return (Double(part(digits[0])) ?? 0) * 3600
-                      + (Double(part(digits[1])) ?? 0) * 60
-                      + (Double(part(digits[2])) ?? 0) + f
+                  let h: Double = Double(part(digits[0])) ?? 0
+                  let mi: Double = Double(part(digits[1])) ?? 0
+                  let s: Double = Double(part(digits[2])) ?? 0
+                  let total: Double = h * 3600 + mi * 60 + s
+                  return total + f
               }
 
               private static func firstIndex(_ sorted: [Double], atLeast t: Double) -> Int {
