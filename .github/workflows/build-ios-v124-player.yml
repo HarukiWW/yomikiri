@@ -5951,6 +5951,7 @@ jobs:
               /// Puts back the subtitle track of the last session. It does not depend on the system language.
               /// KSPlayer selects its own default track shortly after the start, so the choice is repeated a few
               /// times, unless the user picks something else in the meantime.
+              @MainActor
               static func restoreSavedSubtitle(coordinator: KSVideoPlayer.Coordinator, saved: String, key: String) async {
                   for _ in 0..<60 {
                       if !coordinator.subtitleModel.subtitleInfos.isEmpty { break }
@@ -5971,6 +5972,7 @@ jobs:
                   }
               }
 
+              @MainActor
               static func autoSelectJapanese(coordinator: KSVideoPlayer.Coordinator, pickSubtitle: Bool,
                                              excluded: Set<Int> = [], savedChoice: String? = nil) async {
                   guard prefersJapanese else { return }
@@ -7961,7 +7963,7 @@ jobs:
                   guard let url = parts.url else { throw Failure.badURL }
                   var request = URLRequest(url: url, timeoutInterval: 15)
                   request.setValue(key, forHTTPHeaderField: "Authorization")
-                  request.setValue("Yomikiri/1.24", forHTTPHeaderField: "User-Agent")
+                  request.setValue("Yomikiri/1.8", forHTTPHeaderField: "User-Agent")
                   let (data, response) = try await URLSession.shared.data(for: request)
                   let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                   guard status == 200 else { throw Failure.status(status) }
