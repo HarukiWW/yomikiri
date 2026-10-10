@@ -6872,7 +6872,17 @@ jobs:
                               Slider(value: $sheetOpacity, in: 0.3...1.0, step: 0.05)
                           }
                           Section("Субтитры") {
+                              Button("Найти японские субтитры на Jimaku") { searchJimaku() }
                               Button("Добавить свои субтитры") { showImporter = true }
+                              Button("Найти в Jimaku") {
+                                  Task { @MainActor in
+                                      if let file = await JimakuFinder.run(url, report: { syncMessage = $0 }) {
+                                          if !externalURLs.contains(file) { externalURLs.append(file) }
+                                          subDelay = UserDefaults.standard.double(forKey: delayKey)
+                                          chooseExternal(file)
+                                      }
+                                  }
+                              }
                               delayRow
                               Button("Подобрать задержку (Авто)") { autoSync() }
                               if !syncMessage.isEmpty {
@@ -7171,6 +7181,38 @@ jobs:
 
               // MARK: - loading, delay, import, lookup
 
+              /// KSPlayer selects its own default track just after the start, which would switch the chosen file off.
+              /// The file is put back a few times, unless the user has chosen something else meanwhile.
+              @MainActor
+              private func holdExternalChoice(_ file: URL) {
+                  let chosen = "file:" + file.lastPathComponent
+                  Task { @MainActor in
+                      for _ in 0..<6 {
+                          try? await Task.sleep(nanoseconds: 700_000_000)
+                          guard UserDefaults.standard.string(forKey: subChoiceKey) == chosen else { return }
+                          if coordinator.subtitleModel.selectedSubtitleInfo != nil {
+                              coordinator.subtitleModel.selectedSubtitleInfo = nil
+                              usingExternal = true
+                              activeExternal = file
+                          }
+                      }
+                  }
+              }
+
+              /// Searches Jimaku for the open video (the same search as on import) and switches to the file found.
+              @MainActor
+              private func searchJimaku() {
+                  syncMessage = "Jimaku: ищу…"
+                  Task { @MainActor in
+                      if let file = await JimakuFinder.run(url, report: { message in self.syncMessage = message }) {
+                          if !externalURLs.contains(file) { externalURLs.append(file) }
+                          chooseExternal(file)
+                          holdExternalChoice(file)
+                          subDelay = UserDefaults.standard.double(forKey: delayKey)
+                      }
+                  }
+              }
+
               @MainActor
               private func loadSubtitles() async {
                   subDelay = UserDefaults.standard.double(forKey: delayKey)
@@ -7209,6 +7251,7 @@ jobs:
                       let file = folder.appendingPathComponent(String(savedChoice.dropFirst(5)))
                       if FileManager.default.fileExists(atPath: file.path) {
                           chooseExternal(file)
+                          holdExternalChoice(file)
                           restoredFile = true
                       }
                   }
@@ -7221,6 +7264,14 @@ jobs:
                   if !restoredFile, let embeddedChoice {
                       await NativeVideoEngine.restoreSavedSubtitle(coordinator: coordinator, saved: embeddedChoice,
                                                                    key: subChoiceKey)
+                  }
+                  if restoredFile {
+                      for _ in 0..<6 {
+                          try? await Task.sleep(nanoseconds: 600_000_000)
+                          guard UserDefaults.standard.string(forKey: subChoiceKey)?.hasPrefix("file:") == true else { break }
+                          coordinator.subtitleModel.selectedSubtitleInfo = nil
+                          usingExternal = true
+                      }
                   }
               }
 
@@ -8126,6 +8177,61 @@ jobs:
               }
           }
 
+          /// Jimaku search for one video: used by the video list and by the player settings.
+          @available(iOS 16.0, *)
+          @MainActor
+          enum JimakuFinder {
+              /// Returns the saved subtitle file, or nil. Every step is reported through `report`.
+              static func run(_ video: URL, report: @escaping (String) -> Void) async -> URL? {
+                  guard let key = JimakuKeychain.read() else {
+                      report("Jimaku: нет ключа, добавьте его кнопкой в списке видео")
+                      return nil
+                  }
+                  let name = video.lastPathComponent
+                  let parsed = JimakuName.parse(name)
+                  guard let title = parsed.title, let episode = parsed.episode else {
+                      report("Jimaku: не удалось разобрать название")
+                      return nil
+                  }
+                  report("Jimaku: ищу «\(title)»…")
+                  do {
+                      let entries = try await JimakuService.search(title, key: key)
+                      guard let entry = JimakuService.pickEntry(title: title, entries: entries) else {
+                          report("Jimaku: нет однозначного совпадения")
+                          return nil
+                      }
+                      let files = try await JimakuService.files(entry: entry.id, episode: episode, key: key)
+                      for file in JimakuService.pickFiles(files, release: JimakuName.release(name)) {
+                          let temp = try await JimakuService.download(file, key: key)
+                          let ext = (file.name as NSString).pathExtension.lowercased()
+                          let dest = video.deletingPathExtension().appendingPathExtension("jimaku." + ext)
+                          let check = await Task.detached(priority: .utility) { () -> (matches: Int, total: Int, delay: Double)? in
+                              let reference = EmbeddedSubtitles.referenceStarts(url: video)
+                              guard reference.count >= 8 else { return nil }
+                              let external = EmbeddedSubtitles.cues(fromFile: temp).map { $0.start }
+                              guard let r = SubtitleSync.bestOffset(reference: reference, external: external) else { return nil }
+                              return (r.matches, r.total, r.delay)
+                          }.value
+                          guard let r = check, r.matches >= max(8, r.total / 2) else { continue }
+                          try? FileManager.default.removeItem(at: dest)
+                          try FileManager.default.moveItem(at: temp, to: dest)
+                          UserDefaults.standard.set(r.delay, forKey: "subdelay." + name)
+                          UserDefaults.standard.set("file:" + dest.lastPathComponent, forKey: "subchoice." + name)
+                          report("Jimaku: совпало \(r.matches) из \(r.total)")
+                          return dest
+                      }
+                      report("Jimaku: совпадений мало")
+                      return nil
+                  } catch JimakuService.Failure.status(let code) {
+                      report(code == 401 ? "Jimaku: неверный ключ" : code == 429 ? "Jimaku: слишком много запросов" : "Jimaku: ошибка сервера \(code)")
+                      return nil
+                  } catch {
+                      report("Jimaku: нет связи с сайтом")
+                      return nil
+                  }
+              }
+          }
+
           /// One folder of the video library: its files and folders, import, and the background subtitle job.
           @available(iOS 16.0, *)
           @MainActor
@@ -8197,51 +8303,10 @@ jobs:
                   }
               }
 
-              /// Jimaku: finds subtitles for this video by its file name. A file is used only when it matches the video.
+              /// Jimaku for one video from the list; the status shows in the row.
               func tryJimaku(_ video: URL) async -> Bool {
-                  guard let key = JimakuKeychain.read() else { return false }
                   let name = video.lastPathComponent
-                  let parsed = JimakuName.parse(name)
-                  guard let title = parsed.title, let episode = parsed.episode else {
-                      status[name] = "Jimaku: не удалось разобрать название"
-                      return false
-                  }
-                  status[name] = "Jimaku: ищу «\(title)»…"
-                  do {
-                      let entries = try await JimakuService.search(title, key: key)
-                      guard let entry = JimakuService.pickEntry(title: title, entries: entries) else {
-                          status[name] = "Jimaku: нет однозначного совпадения"
-                          return false
-                      }
-                      let files = try await JimakuService.files(entry: entry.id, episode: episode, key: key)
-                      for file in JimakuService.pickFiles(files, release: JimakuName.release(name)) {
-                          let temp = try await JimakuService.download(file, key: key)
-                          let ext = (file.name as NSString).pathExtension.lowercased()
-                          let dest = video.deletingPathExtension().appendingPathExtension("jimaku." + ext)
-                          let check = await Task.detached(priority: .utility) { () -> (matches: Int, total: Int, delay: Double)? in
-                              let reference = EmbeddedSubtitles.referenceStarts(url: video)
-                              guard reference.count >= 8 else { return nil }
-                              let external = EmbeddedSubtitles.cues(fromFile: temp).map { $0.start }
-                              guard let r = SubtitleSync.bestOffset(reference: reference, external: external) else { return nil }
-                              return (r.matches, r.total, r.delay)
-                          }.value
-                          guard let r = check, r.matches >= max(8, r.total / 2) else { continue }
-                          try? FileManager.default.removeItem(at: dest)
-                          try FileManager.default.moveItem(at: temp, to: dest)
-                          UserDefaults.standard.set(r.delay, forKey: "subdelay." + name)
-                          UserDefaults.standard.set("file:" + dest.lastPathComponent, forKey: "subchoice." + name)
-                          status[name] = "Jimaku: совпало \(r.matches) из \(r.total)"
-                          return true
-                      }
-                      status[name] = "Jimaku: совпадений мало"
-                      return false
-                  } catch JimakuService.Failure.status(let code) {
-                      status[name] = code == 401 ? "Jimaku: неверный ключ" : code == 429 ? "Jimaku: слишком много запросов" : "Jimaku: ошибка сервера \(code)"
-                      return false
-                  } catch {
-                      status[name] = "Jimaku: нет связи с сайтом"
-                      return false
-                  }
+                  return await JimakuFinder.run(video) { self.status[name] = $0 } != nil
               }
 
               /// Runs before the OCR question: Jimaku is tried only when the video has no Japanese text track.
