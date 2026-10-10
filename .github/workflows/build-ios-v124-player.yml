@@ -5947,7 +5947,6 @@ jobs:
 
               /// KSPlayer overwrites coordinator.onStateChanged, so tracks are polled until they appear.
               /// Text Japanese subtitles win over bitmap ones (bitmap subtitles cannot be looked up).
-              @MainActor
               /// Puts back the subtitle track of the last session. It does not depend on the system language.
               /// KSPlayer selects its own default track shortly after the start, so the choice is repeated a few
               /// times, unless the user picks something else in the meantime.
